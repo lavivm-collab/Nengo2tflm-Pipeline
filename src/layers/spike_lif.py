@@ -6,7 +6,11 @@ import tensorflow as tf
 # 1. We still need the Keras "Stub" for TFLite to recognize the op
 @tf.keras.utils.register_keras_serializable()
 class LIFSpikeLayer(tf.keras.layers.Layer):
-    def call(self, inputs): return tf.identity(inputs)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def call(self, inputs):
+        return tf.identity(inputs)
 
 
 # 2. The Custom Nengo Component

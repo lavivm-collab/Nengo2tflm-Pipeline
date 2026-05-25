@@ -72,7 +72,7 @@ def convert_complex_dag(
         network: nengo.Network,
         start_nodes: Union[nengo.Node, List[nengo.Node]],
         output_nodes: Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]],
-        tflite_path: str = "resnet_snn.tflite"
+        tflite_path: str = "snn.tflite"
 ) -> None:
     """
     Compiles complex Nengo Directed Acyclic Graphs (DAGs) into a deployment-ready
@@ -91,7 +91,7 @@ def convert_complex_dag(
         The exit-point component (or list of components) marking the network's processed results.
     tflite_path : str, optional
         The destination storage path for the generated binary flatbuffer model.
-        Defaults to "resnet_snn.tflite".
+        Defaults to "snn.tflite".
 
     Returns:
     --------
@@ -180,7 +180,22 @@ def convert_complex_dag(
 
     # Freeze to TFLite format
     converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+
+    import numpy as np
+    def representative_data_gen():
+        for _ in range(200):
+            # Yield dummy data matching your input shape and type
+            # Replace (1, 10) with your actual input shape
+            yield [np.random.uniform(-1, 1, size=(1, 1)).astype(np.float32)]
+
+    converter.representative_dataset = representative_data_gen
+
+
     converter.allow_custom_ops = True
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+    ]
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
     tflite_model = converter.convert()
 
     with open(tflite_path, "wb") as f:
