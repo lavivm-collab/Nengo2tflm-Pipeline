@@ -179,3 +179,10 @@ def convert_complex_dag(
     print("[Compiler] Structural verification complete. Exporting hardware flatbuffer...")
 
     # Freeze to TFLite format
+    converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+    converter.allow_custom_ops = True
+    tflite_model = converter.convert()
+
+    with open(tflite_path, "wb") as f:
+        f.write(tflite_model)
+    print(f"[Compiler] Success! Compiled file saved to: {tflite_path}")
