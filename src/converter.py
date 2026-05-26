@@ -1,6 +1,10 @@
-import tensorflow as tf
 import nengo
-from typing import List, Union, Dict, Any
+import tensorflow as tf
+from tensorflow.core.protobuf import saved_model_pb2
+import os
+import tempfile
+import shutil
+from typing import List, Union, Dict
 
 
 # =====================================================================
@@ -9,33 +13,16 @@ from typing import List, Union, Dict, Any
 def topological_sort_and_detect_loops(network: nengo.Network) -> List[Union[nengo.Ensemble, nengo.Node]]:
     """
     Performs a topological sort on all components within a Nengo network using
-    Kahn's Algorithm, while defending against un-routable recurrent cycles.
-
-    Parameters:
-    -----------
-    network : nengo.Network
-        The complete Nengo network instance containing the blocks and connections.
-
-    Returns:
-    --------
-    List[Union[nengo.Ensemble, nengo.Node]]
-        A linearly ordered sequence of Nengo components ready for execution processing.
-
-    Raises:
-    -------
-    ValueError
-        If a feedback/recurrent loop is detected, preventing linear hardware scheduling.
+    Kahn's Algorithm, defending against un-routable recurrent cycles.
     """
     all_objects: List[Union[nengo.Ensemble, nengo.Node]] = network.all_ensembles + network.all_nodes
     adj: Dict[Union[nengo.Ensemble, nengo.Node], List[nengo.Connection]] = {obj: [] for obj in all_objects}
     in_degree: Dict[Union[nengo.Ensemble, nengo.Node], int] = {obj: 0 for obj in all_objects}
 
-    # Map connections and calculate incoming dependencies
     for conn in network.all_connections:
         adj[conn.pre].append(conn)
         in_degree[conn.post] += 1
 
-    # Queue up source nodes (components with 0 incoming dependencies)
     queue: List[Union[nengo.Ensemble, nengo.Node]] = [obj for obj, deg in in_degree.items() if deg == 0]
     execution_order: List[Union[nengo.Ensemble, nengo.Node]] = []
 
@@ -49,68 +36,44 @@ def topological_sort_and_detect_loops(network: nengo.Network) -> List[Union[neng
             if in_degree[neighbor] == 0:
                 queue.append(neighbor)
 
-    # --- LOOP DEFENSE CHECK ---
     if len(execution_order) != len(all_objects):
-        # Identify the exact nodes stuck in the cycle
         problematic_nodes: List[str] = [str(obj.label) for obj, deg in in_degree.items() if deg > 0]
-
         raise ValueError(
             f"\n[FATAL ERROR] Recurrent Loop Detected in Nengo Network!\n"
             f"TensorFlow Lite Micro cannot compile recurrent memory loops.\n"
             f"The following components are locked in a cycle: {problematic_nodes}\n"
-            f"Please break the feedback loop before deploying to hardware."
         )
 
     return execution_order
 
 
 # =====================================================================
-# 2. MULTI-IO / RESNET FUNCTIONAL COMPILER
+# 2. UNIFIED FUNCTIONAL COMPILER & INJECTOR
 # =====================================================================
-def convert_complex_dag(
+def convert_and_inject_complex_dag(
         sim: nengo.Simulator,
         network: nengo.Network,
         start_nodes: Union[nengo.Node, List[nengo.Node]],
         output_nodes: Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]],
+        target_namespace: str,
+        placeholder_op: str = "Sin",
+        custom_op_name: str = "LIFSpikeLayer",
         tflite_path: str = "snn.tflite"
 ) -> None:
     """
-    Compiles complex Nengo Directed Acyclic Graphs (DAGs) into a deployment-ready
-    TensorFlow Lite binary file, natively preserving multi-path signal additions (ResNet paths)
-    and multi-input/multi-output configurations.
-
-    Parameters:
-    -----------
-    sim : nengo.Simulator
-        The active Nengo simulator instance holding optimized live network weights.
-    network : nengo.Network
-        The architectural layout definition containing the SNN components.
-    start_nodes : Union[nengo.Node, List[nengo.Node]]
-        The entry-point Nengo Node (or list of Nodes) where input signals enter the network.
-    output_nodes : Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]]
-        The exit-point component (or list of components) marking the network's processed results.
-    tflite_path : str, optional
-        The destination storage path for the generated binary flatbuffer model.
-        Defaults to "snn.tflite".
-
-    Returns:
-    --------
-    None
-        Writes the final compilation product directly to disk at the designated `tflite_path`.
+    Compiles complex Nengo Directed Acyclic Graphs (DAGs) into a Functional Keras model,
+    surgically injects custom C++ operator definitions into the GraphDef (including the 
+    TF2 Function Library), and saves a deployment-ready TFLite binary file.
     """
-    # Force inputs and outputs into lists to standardize multi-IO iterations safely
+    # --- PHASE 1: NENGO TO KERAS TRANSLATION ---
     start_list: List[nengo.Node] = start_nodes if isinstance(start_nodes, list) else [start_nodes]
     output_list: List[Union[nengo.Node, nengo.Ensemble]] = output_nodes if isinstance(output_nodes, list) else [
         output_nodes]
 
-    # Validate graph structure and guard against cycles
-    sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]] = topological_sort_and_detect_loops(network)
-
-    # Tensor map serves as our virtual routing breadboard
+    sorted_nodes = topological_sort_and_detect_loops(network)
     tensor_map: Dict[Union[nengo.Ensemble, nengo.Node], tf.Tensor] = {}
     input_tensors: List[tf.Tensor] = []
 
-    # Step 1: Initialize all network entry points (Multiple Inputs)
     for node in start_list:
         shape = (int(node.size_out),) if hasattr(node, 'size_out') else (1,)
         inp = tf.keras.Input(shape=shape, name=f"Input_{node.label}")
@@ -119,13 +82,11 @@ def convert_complex_dag(
 
     print(f"[Compiler] Instantiated {len(input_tensors)} parallel network inputs.")
 
-    # Step 2: Route through the topologically sorted DAG
     for obj in sorted_nodes:
         if obj in start_list:
             continue
 
-        # Collect every incoming branch hitting this component
-        incoming_conns: List[nengo.Connection] = [c for c in network.all_connections if c.post == obj]
+        incoming_conns = [c for c in network.all_connections if c.post == obj]
         if not incoming_conns:
             continue
 
@@ -133,9 +94,8 @@ def convert_complex_dag(
         for conn in incoming_conns:
             src_tensor = tensor_map.get(conn.pre)
             if src_tensor is None:
-                continue  # Path originates from an unmapped or skipped sub-graph region
+                continue
 
-            # Compile connection modifications (Decoders / Weights / Synapses)
             if hasattr(conn, 'to_keras'):
                 layers, weights = conn.to_keras(sim)
                 x = src_tensor
@@ -144,19 +104,16 @@ def convert_complex_dag(
                 layers[0].set_weights(weights)
                 branch_outputs.append(x)
             else:
-                branch_outputs.append(src_tensor)  # Clean wire / skip connection pass-through
+                branch_outputs.append(src_tensor)
 
         if not branch_outputs:
             continue
 
-        # --- RESNET MERGE / ADDITION ---
-        # If multiple branches (like a processing path AND a skip connection) converge, sum them
         if len(branch_outputs) > 1:
             total_input = tf.keras.layers.Add(name=f"ResNet_Sum_{obj.label}")(branch_outputs)
         else:
             total_input = branch_outputs[0]
 
-        # Pass the consolidated signal through the current node's internal hardware operations
         if hasattr(obj, 'to_keras'):
             layers, weights = obj.to_keras(sim)
             x = total_input
@@ -167,37 +124,75 @@ def convert_complex_dag(
         else:
             tensor_map[obj] = total_input
 
-    # Step 3: Bundle target terminations (Multiple Outputs)
-    final_outputs: List[tf.Tensor] = [tensor_map[node] for node in output_list if node in tensor_map]
+    final_outputs = [tensor_map[node] for node in output_list if node in tensor_map]
 
-    # Build Functional Keras model mapping all inputs directly to all outputs
     keras_model = tf.keras.Model(
         inputs=input_tensors if len(input_tensors) > 1 else input_tensors[0],
         outputs=final_outputs if len(final_outputs) > 1 else final_outputs[0]
     )
 
-    print("[Compiler] Structural verification complete. Exporting hardware flatbuffer...")
+    print("[Compiler] Structural translation complete. Initiating deep GraphDef injection...")
 
-    # Freeze to TFLite format
-    converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+    # --- PHASE 3 PRE-REGISTRATION: PREVENT LOADER PANIC ---
+    # CRITICAL FIX: The input/output names MUST be 'x' and 'y' to prevent KeyError port mismatches
+    custom_opdef = f"""name: '{custom_op_name}'
+input_arg: {{ name: 'x' type: DT_FLOAT }}
+output_arg: {{ name: 'y' type: DT_FLOAT }}"""
 
-    import numpy as np
-    def representative_data_gen():
-        for _ in range(200):
-            # Yield dummy data matching your input shape and type
-            # Replace (1, 10) with your actual input shape
-            yield [np.random.uniform(-1, 1, size=(1, 1)).astype(np.float32)]
+    try:
+        from tensorflow.lite.python.convert import register_custom_opdefs
+        register_custom_opdefs([custom_opdef])
+        print(f"[Compiler] -> Safely pre-registered custom op signature for '{custom_op_name}'")
+    except Exception as e:
+        print(f"[Compiler] -> Warning during OpDef registration: {e}")
 
-    converter.representative_dataset = representative_data_gen
+    # --- PHASE 2: DEEP GRAPHDEF SURGICAL INJECTION ---
+    temp_dir = tempfile.mkdtemp()
+    try:
+        keras_model.save(temp_dir)
+        saved_model_path = os.path.join(temp_dir, "saved_model.pb")
 
+        sm = saved_model_pb2.SavedModel()
+        with tf.io.gfile.GFile(saved_model_path, "rb") as f:
+            sm.ParseFromString(f.read())
 
-    converter.allow_custom_ops = True
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS_INT8
-    ]
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    tflite_model = converter.convert()
+        patch_count = 0
+        for meta_graph in sm.meta_graphs:
 
-    with open(tflite_path, "wb") as f:
-        f.write(tflite_model)
-    print(f"[Compiler] Success! Compiled file saved to: {tflite_path}")
+            # 1. Scan the main graph blueprint
+            for node in meta_graph.graph_def.node:
+                if target_namespace.lower() in node.name.lower() and node.op == placeholder_op:
+                    print(f"[Injector] -> Patching target node (Main Graph): {node.name}")
+                    node.op = custom_op_name
+                    patch_count += 1
+
+            # 2. Scan the TF2 Function Library (Where the KeyError was occurring)
+            for func in meta_graph.graph_def.library.function:
+                for node in func.node_def:
+                    if target_namespace.lower() in node.name.lower() and node.op == placeholder_op:
+                        print(f"[Injector] -> Patching target node (Function Library): {node.name}")
+                        node.op = custom_op_name
+                        patch_count += 1
+
+        print(
+            f"[Injector] GraphDef patch complete. Rewrote {patch_count} '{placeholder_op}' node(s) to '{custom_op_name}'.")
+
+        with tf.io.gfile.GFile(saved_model_path, "wb") as f:
+            f.write(sm.SerializeToString())
+
+        # --- PHASE 3: TFLITE COMPILATION ---
+        print("[Compiler] Compiling patched blueprint to TFLite flatbuffer...")
+        converter = tf.lite.TFLiteConverter.from_saved_model(temp_dir)
+
+        converter.allow_custom_ops = True
+        converter.optimizations = []
+
+        tflite_model = converter.convert()
+
+        with open(tflite_path, "wb") as f:
+            f.write(tflite_model)
+
+        print(f"[Compiler] Success! Hardware-ready file saved to: {tflite_path}")
+
+    finally:
+        shutil.rmtree(temp_dir)

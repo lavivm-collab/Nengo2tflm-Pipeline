@@ -7,7 +7,7 @@ from nengo.utils.matplotlib import rasterplot
 
 from layers.spike_lif import HardwareLIFEnsemble
 from layers.synapse import HardwareConnection
-from src.converter import convert_complex_dag
+from src.converter import convert_and_inject_complex_dag
 
 model = nengo.Network(label="Two Neurons")
 with model:
@@ -62,11 +62,13 @@ def plot_test():
 
     plt.show()
 
-
-convert_complex_dag(
+convert_and_inject_complex_dag(
         sim=sim,
         network=model,
-        start_nodes=sin,
-        output_nodes=out,
-        tflite_path="dest/two_neuron_sine.tflite"
+        start_nodes=sin,                # The entry node
+        output_nodes=out,          # The final component to track
+        target_namespace="lif_spike",   # The substring our injector hunts for
+        placeholder_op="Sin",           # The dummy math used in Python
+        custom_op_name="LIFSpikeLayer", # The final token for the C++ microcontroller
+        tflite_path="two_neurons.tflite"
     )

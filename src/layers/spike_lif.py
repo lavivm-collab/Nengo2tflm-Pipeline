@@ -10,7 +10,7 @@ class LIFSpikeLayer(tf.keras.layers.Layer):
         super().__init__(**kwargs)
 
     def call(self, inputs):
-        return tf.identity(inputs)
+        return tf.math.sin(inputs)
 
 
 # 2. The Custom Nengo Component
@@ -20,5 +20,5 @@ class HardwareLIFEnsemble(nengo.Ensemble):
         W = (encoders * gains[:, np.newaxis]).T
 
         encoder_dense = tf.keras.layers.Dense(self.n_neurons, name=f'{self.label}_Encoders')
-        hardware_lif = LIFSpikeLayer(name=f'{self.label}_Hardware_Op')
+        hardware_lif = LIFSpikeLayer(name=f'lif_spike_hardware_node')
         return [encoder_dense, hardware_lif], [W, biases]
