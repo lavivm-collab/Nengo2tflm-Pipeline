@@ -70,5 +70,5 @@ convert_and_inject_complex_dag(
         target_namespace="lif_spike",   # The substring our injector hunts for
         placeholder_op="Sin",           # The dummy math used in Python
         custom_op_name="LIFSpikeLayer", # The final token for the C++ microcontroller
-        tflite_path="two_neurons.tflite"
+        tflite_path="dest/two_neurons.tflite"
     )

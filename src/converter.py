@@ -8,7 +8,7 @@ from typing import List, Union, Dict
 
 
 # =====================================================================
-# 1. GRAPH VALIDATION ENGINE (Cycle Detection)
+# 1. GRAPH VALIDATION ENGINE
 # =====================================================================
 def topological_sort_and_detect_loops(network: nengo.Network) -> List[Union[nengo.Ensemble, nengo.Node]]:
     """
@@ -48,40 +48,35 @@ def topological_sort_and_detect_loops(network: nengo.Network) -> List[Union[neng
 
 
 # =====================================================================
-# 2. UNIFIED FUNCTIONAL COMPILER & INJECTOR
+# 2. SUB-COMPONENTS & PIPELINE STAGES
 # =====================================================================
-def convert_and_inject_complex_dag(
+
+def build_keras_model_from_nengo(
         sim: nengo.Simulator,
         network: nengo.Network,
         start_nodes: Union[nengo.Node, List[nengo.Node]],
-        output_nodes: Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]],
-        target_namespace: str,
-        placeholder_op: str = "Sin",
-        custom_op_name: str = "LIFSpikeLayer",
-        tflite_path: str = "snn.tflite"
-) -> None:
+        output_nodes: Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]]
+) -> tf.keras.Model:
     """
-    Compiles complex Nengo Directed Acyclic Graphs (DAGs) into a Functional Keras model,
-    surgically injects custom C++ operator definitions into the GraphDef (including the 
-    TF2 Function Library), and saves a deployment-ready TFLite binary file.
+    Translates a Nengo computational DAG into an executable Functional Keras Model.
     """
-    # --- PHASE 1: NENGO TO KERAS TRANSLATION ---
-    start_list: List[nengo.Node] = start_nodes if isinstance(start_nodes, list) else [start_nodes]
-    output_list: List[Union[nengo.Node, nengo.Ensemble]] = output_nodes if isinstance(output_nodes, list) else [
-        output_nodes]
+    start_list = start_nodes if isinstance(start_nodes, list) else [start_nodes]
+    output_list = output_nodes if isinstance(output_nodes, list) else [output_nodes]
 
     sorted_nodes = topological_sort_and_detect_loops(network)
     tensor_map: Dict[Union[nengo.Ensemble, nengo.Node], tf.Tensor] = {}
     input_tensors: List[tf.Tensor] = []
 
+    # Initialize network entry points
     for node in start_list:
         shape = (int(node.size_out),) if hasattr(node, 'size_out') else (1,)
         inp = tf.keras.Input(shape=shape, name=f"Input_{node.label}")
         input_tensors.append(inp)
         tensor_map[node] = inp
 
-    print(f"[Compiler] Instantiated {len(input_tensors)} parallel network inputs.")
+    print(f"[Model Builder] Instantiated {len(input_tensors)} network inputs.")
 
+    # Route signals sequentially through the topological order
     for obj in sorted_nodes:
         if obj in start_list:
             continue
@@ -109,11 +104,13 @@ def convert_and_inject_complex_dag(
         if not branch_outputs:
             continue
 
+        # Handle structural convergence (ResNet summation style)
         if len(branch_outputs) > 1:
             total_input = tf.keras.layers.Add(name=f"ResNet_Sum_{obj.label}")(branch_outputs)
         else:
             total_input = branch_outputs[0]
 
+        # Apply target layer translation logic
         if hasattr(obj, 'to_keras'):
             layers, weights = obj.to_keras(sim)
             x = total_input
@@ -126,15 +123,17 @@ def convert_and_inject_complex_dag(
 
     final_outputs = [tensor_map[node] for node in output_list if node in tensor_map]
 
-    keras_model = tf.keras.Model(
+    return tf.keras.Model(
         inputs=input_tensors if len(input_tensors) > 1 else input_tensors[0],
         outputs=final_outputs if len(final_outputs) > 1 else final_outputs[0]
     )
 
-    print("[Compiler] Structural translation complete. Initiating deep GraphDef injection...")
 
-    # --- PHASE 3 PRE-REGISTRATION: PREVENT LOADER PANIC ---
-    # CRITICAL FIX: The input/output names MUST be 'x' and 'y' to prevent KeyError port mismatches
+def register_custom_hardware_op(custom_op_name: str) -> None:
+    """
+    Registers the custom C++ hardware operation signature with the active
+    TensorFlow runtime environment using matching 'x' and 'y' input/output ports.
+    """
     custom_opdef = f"""name: '{custom_op_name}'
 input_arg: {{ name: 'x' type: DT_FLOAT }}
 output_arg: {{ name: 'y' type: DT_FLOAT }}"""
@@ -142,57 +141,105 @@ output_arg: {{ name: 'y' type: DT_FLOAT }}"""
     try:
         from tensorflow.lite.python.convert import register_custom_opdefs
         register_custom_opdefs([custom_opdef])
-        print(f"[Compiler] -> Safely pre-registered custom op signature for '{custom_op_name}'")
+        print(f"[Registry] -> Safely pre-registered custom op signature for '{custom_op_name}'")
     except Exception as e:
-        print(f"[Compiler] -> Warning during OpDef registration: {e}")
+        print(f"[Registry] -> Warning during custom OpDef memory allocation: {e}")
 
-    # --- PHASE 2: DEEP GRAPHDEF SURGICAL INJECTION ---
-    temp_dir = tempfile.mkdtemp()
-    try:
-        keras_model.save(temp_dir)
-        saved_model_path = os.path.join(temp_dir, "saved_model.pb")
 
-        sm = saved_model_pb2.SavedModel()
-        with tf.io.gfile.GFile(saved_model_path, "rb") as f:
-            sm.ParseFromString(f.read())
+def patch_saved_model_protobuf(
+        saved_model_dir: str,
+        target_namespace: str,
+        placeholder_op: str,
+        custom_op_name: str
+) -> int:
+    """
+    Surgically searches the SavedModel asset and replaces designated math placeholders
+    inside both the Main Graph Def and the hidden TF2 Function Def Library.
+    """
+    saved_model_path = os.path.join(saved_model_dir, "saved_model.pb")
+    sm = saved_model_pb2.SavedModel()
 
-        patch_count = 0
-        for meta_graph in sm.meta_graphs:
+    with tf.io.gfile.GFile(saved_model_path, "rb") as f:
+        sm.ParseFromString(f.read())
 
-            # 1. Scan the main graph blueprint
-            for node in meta_graph.graph_def.node:
+    patch_count = 0
+    for meta_graph in sm.meta_graphs:
+        # 1. Scan Main Graph Blueprint
+        for node in meta_graph.graph_def.node:
+            if target_namespace.lower() in node.name.lower() and node.op == placeholder_op:
+                print(f"[Injector] -> Patching target node (Main Graph): {node.name}")
+                node.op = custom_op_name
+                patch_count += 1
+
+        # 2. Scan Encapsulated Function Library Components
+        for func in meta_graph.graph_def.library.function:
+            for node in func.node_def:
                 if target_namespace.lower() in node.name.lower() and node.op == placeholder_op:
-                    print(f"[Injector] -> Patching target node (Main Graph): {node.name}")
+                    print(f"[Injector] -> Patching target node (Function Library): {node.name}")
                     node.op = custom_op_name
                     patch_count += 1
 
-            # 2. Scan the TF2 Function Library (Where the KeyError was occurring)
-            for func in meta_graph.graph_def.library.function:
-                for node in func.node_def:
-                    if target_namespace.lower() in node.name.lower() and node.op == placeholder_op:
-                        print(f"[Injector] -> Patching target node (Function Library): {node.name}")
-                        node.op = custom_op_name
-                        patch_count += 1
+    # Overwrite binary on disk with modified architecture definition
+    with tf.io.gfile.GFile(saved_model_path, "wb") as f:
+        f.write(sm.SerializeToString())
 
-        print(
-            f"[Injector] GraphDef patch complete. Rewrote {patch_count} '{placeholder_op}' node(s) to '{custom_op_name}'.")
+    return patch_count
 
-        with tf.io.gfile.GFile(saved_model_path, "wb") as f:
-            f.write(sm.SerializeToString())
 
-        # --- PHASE 3: TFLITE COMPILATION ---
-        print("[Compiler] Compiling patched blueprint to TFLite flatbuffer...")
-        converter = tf.lite.TFLiteConverter.from_saved_model(temp_dir)
+def compile_saved_model_to_tflite(saved_model_dir: str, tflite_path: str) -> None:
+    """
+    Invokes the TFLite compilation subsystem to output the finalized deployment binary.
+    """
+    print("[TFLite Compiler] Compiling patched blueprint to flatbuffer...")
+    converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
 
-        converter.allow_custom_ops = True
-        converter.optimizations = []
+    converter.allow_custom_ops = True
+    converter.optimizations = []  # Preserve pure layer structures for edge custom delegates
 
-        tflite_model = converter.convert()
+    tflite_model = converter.convert()
 
-        with open(tflite_path, "wb") as f:
-            f.write(tflite_model)
+    with open(tflite_path, "wb") as f:
+        f.write(tflite_model)
 
-        print(f"[Compiler] Success! Hardware-ready file saved to: {tflite_path}")
+
+# =====================================================================
+# 3. HIGH-LEVEL ORCHESTRATOR PIPELINE
+# =====================================================================
+def convert_and_inject_complex_dag(
+        sim: nengo.Simulator,
+        network: nengo.Network,
+        start_nodes: Union[nengo.Node, List[nengo.Node]],
+        output_nodes: Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]],
+        target_namespace: str,
+        placeholder_op: str = "Sin",
+        custom_op_name: str = "LIFSpikeLayer",
+        tflite_path: str = "snn.tflite"
+) -> None:
+    """
+    Executes the clean, step-by-step pipeline to transform a Nengo DAG into a
+    hardware-ready custom TFLite model configuration.
+    """
+    # Step 1: Translate Nengo structure to Keras architecture
+    keras_model = build_keras_model_from_nengo(sim, network, start_nodes, output_nodes)
+    print("[Pipeline] Keras structural translation complete.")
+
+    # Step 2: Inform the local process environment about our hardware op mapping
+    register_custom_hardware_op(custom_op_name)
+
+    # Use a secure contextual memory scope for temporary translation artifacts
+    temp_dir = tempfile.mkdtemp()
+    try:
+        # Step 3: Export temporary disk blueprints to unlock Protobuf access
+        keras_model.save(temp_dir)
+
+        # Step 4: Run the deep-graph patcher
+        patches = patch_saved_model_protobuf(temp_dir, target_namespace, placeholder_op, custom_op_name)
+        print(f"[Pipeline] Deep patch complete. Mutated {patches} nodes to '{custom_op_name}'.")
+
+        # Step 5: Convert the modified model layout to TFLite
+        compile_saved_model_to_tflite(temp_dir, tflite_path)
+        print(f"[Pipeline] Success! Final compiled binary delivered to -> {tflite_path}")
 
     finally:
+        # Step 6: Guarantee temp folder cleanup regardless of execution success state
         shutil.rmtree(temp_dir)
