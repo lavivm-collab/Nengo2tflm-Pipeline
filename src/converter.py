@@ -1,10 +1,10 @@
-import nengo
-import tensorflow as tf
-from tensorflow.core.protobuf import saved_model_pb2
 import os
 import tempfile
 import shutil
 from typing import List, Union, Dict
+import nengo
+import tensorflow as tf
+from tensorflow.core.protobuf import saved_model_pb2
 
 
 # =====================================================================
@@ -50,7 +50,6 @@ def topological_sort_and_detect_loops(network: nengo.Network) -> List[Union[neng
 # =====================================================================
 # 2. SUB-COMPONENTS & PIPELINE STAGES
 # =====================================================================
-
 def build_keras_model_from_nengo(
         sim: nengo.Simulator,
         network: nengo.Network,
@@ -131,17 +130,21 @@ def build_keras_model_from_nengo(
 
 def register_custom_hardware_op(custom_op_name: str) -> None:
     """
-    Registers the custom C++ hardware operation signature with the active
-    TensorFlow runtime environment using matching 'x' and 'y' input/output ports.
+    Registers custom C++ hardware operation signatures with the active
+    TensorFlow runtime environment so the parser doesn't crash during load.
     """
-    custom_opdef = f"""name: '{custom_op_name}'
+    synapse_opdef = """name: 'HardwareSynapseLayer'
+input_arg: { name: 'x' type: DT_FLOAT }
+output_arg: { name: 'y' type: DT_FLOAT }"""
+
+    lif_opdef = f"""name: '{custom_op_name}'
 input_arg: {{ name: 'x' type: DT_FLOAT }}
 output_arg: {{ name: 'y' type: DT_FLOAT }}"""
 
     try:
         from tensorflow.lite.python.convert import register_custom_opdefs
-        register_custom_opdefs([custom_opdef])
-        print(f"[Registry] -> Safely pre-registered custom op signature for '{custom_op_name}'")
+        register_custom_opdefs([synapse_opdef, lif_opdef])
+        print(f"[Registry] -> Registered custom op signatures for 'HardwareSynapseLayer' and '{custom_op_name}'")
     except Exception as e:
         print(f"[Registry] -> Warning during custom OpDef memory allocation: {e}")
 
@@ -152,10 +155,6 @@ def patch_saved_model_protobuf(
         placeholder_op: str,
         custom_op_name: str
 ) -> int:
-    """
-    Surgically searches the SavedModel asset and replaces designated math placeholders
-    inside both the Main Graph Def and the hidden TF2 Function Def Library.
-    """
     saved_model_path = os.path.join(saved_model_dir, "saved_model.pb")
     sm = saved_model_pb2.SavedModel()
 
@@ -167,19 +166,24 @@ def patch_saved_model_protobuf(
         # 1. Scan Main Graph Blueprint
         for node in meta_graph.graph_def.node:
             if target_namespace.lower() in node.name.lower() and node.op == placeholder_op:
-                print(f"[Injector] -> Patching target node (Main Graph): {node.name}")
                 node.op = custom_op_name
+                patch_count += 1
+            # Look for our Cosine placeholder in synapse layers
+            elif "hardware_synapse" in node.name.lower() and node.op == "Cos":
+                node.op = "HardwareSynapseLayer"
                 patch_count += 1
 
         # 2. Scan Encapsulated Function Library Components
         for func in meta_graph.graph_def.library.function:
             for node in func.node_def:
                 if target_namespace.lower() in node.name.lower() and node.op == placeholder_op:
-                    print(f"[Injector] -> Patching target node (Function Library): {node.name}")
                     node.op = custom_op_name
                     patch_count += 1
+                # Look for our Cosine placeholder in synapse layers
+                elif "hardware_synapse" in node.name.lower() and node.op == "Cos":
+                    node.op = "HardwareSynapseLayer"
+                    patch_count += 1
 
-    # Overwrite binary on disk with modified architecture definition
     with tf.io.gfile.GFile(saved_model_path, "wb") as f:
         f.write(sm.SerializeToString())
 
@@ -203,7 +207,91 @@ def compile_saved_model_to_tflite(saved_model_dir: str, tflite_path: str) -> Non
 
 
 # =====================================================================
-# 3. HIGH-LEVEL ORCHESTRATOR PIPELINE
+# 3. TEMPLATE-BASED C++ HEADER GENERATOR
+# =====================================================================
+def generate_hardware_header_from_template(network: nengo.Network, output_dir: str,
+                                           template_name: str = "hardware_config.template") -> None:
+    """
+    Extracts physical neuron and synapse configuration properties and updates a structured
+    C++ template configuration file mapped perfectly to topological processing sequences.
+    """
+    sorted_nodes = topological_sort_and_detect_loops(network)
+
+    # 1. Extract Ensembles
+    ensembles_found = []
+    for obj in sorted_nodes:
+        if obj.__class__.__name__ == "HardwareLIFEnsemble" or hasattr(obj, 'neuron_type'):
+            tau_rc = getattr(obj.neuron_type, 'tau_rc', 0.02)
+            tau_ref = getattr(obj.neuron_type, 'tau_ref', 0.002)
+            v_threshold = 1.0
+
+            ensembles_found.append({
+                "label": (obj.label or f"ensemble_{id(obj)}").replace(" ", "_"),
+                "neurons": obj.n_neurons,
+                "dimensions": obj.dimensions,
+                "tau_rc": float(tau_rc),
+                "tau_ref": float(tau_ref),
+                "v_threshold": float(v_threshold)
+            })
+
+    # 2. Extract Synapses
+    synapses_found = []
+    for conn in network.all_connections:
+        # Check if the connection has a physical synapse with a tau parameter
+        if hasattr(conn, 'synapse') and hasattr(conn.synapse, 'tau'):
+            pre_label = (conn.pre.label or f"node_{id(conn.pre)}").replace(" ", "_")
+            post_label = (conn.post.label or f"node_{id(conn.post)}").replace(" ", "_")
+            tau = float(conn.synapse.tau)
+
+            synapses_found.append({
+                "pre_label": pre_label,
+                "post_label": post_label,
+                "tau": tau
+            })
+
+    # 3. Read Template
+    template_path = os.path.join(os.path.dirname(__file__), template_name)
+    if not os.path.exists(template_path):
+        template_path = template_name
+
+    if not os.path.exists(template_path):
+        print(f"[Template Engine] Warning: Could not locate '{template_name}'. Skipping C++ export.")
+        return
+
+    with open(template_path, "r") as f:
+        template_content = f.read()
+
+    # 4. Form formatted data rows for Ensemble array population
+    ens_lines = []
+    for index, ens in enumerate(ensembles_found):
+        comma = "," if index < len(ensembles_found) - 1 else ""
+        ens_lines.append(
+            f'    {{ "{ens["label"]}", {ens["neurons"]}, {ens["dimensions"]}, '
+            f'{ens["tau_rc"]:.6f}f, {ens["tau_ref"]:.6f}f, {ens["v_threshold"]:.1f}f }}{comma}'
+        )
+    ens_entries_str = "\n".join(ens_lines)
+
+    # 5. Form formatted data rows for Synapse array population
+    syn_lines = []
+    for index, syn in enumerate(synapses_found):
+        comma = "," if index < len(synapses_found) - 1 else ""
+        syn_lines.append(
+            f'    {{ "{syn["pre_label"]}", "{syn["post_label"]}", {syn["tau"]:.6f}f }}{comma}'
+        )
+    syn_entries_str = "\n".join(syn_lines)
+
+    # 6. Inject variables directly inside template structure
+    final_output = template_content.replace("{NUM_ENSEMBLES}", str(len(ensembles_found)))
+    final_output = final_output.replace("{ENSEMBLE_ENTRIES}", ens_entries_str)
+    final_output = final_output.replace("{NUM_SYNAPSES}", str(len(synapses_found)))
+    final_output = final_output.replace("{SYNAPSE_ENTRIES}", syn_entries_str)
+
+    h_file_path = os.path.join(output_dir, "hardware_config.h")
+    with open(h_file_path, "w") as f:
+        f.write(final_output)
+    print(f"[Template Engine] Statically compiled hardware properties saved to -> {h_file_path}")
+# =====================================================================
+# 4. HIGH-LEVEL ORCHESTRATOR PIPELINE
 # =====================================================================
 def convert_and_inject_complex_dag(
         sim: nengo.Simulator,
@@ -216,30 +304,34 @@ def convert_and_inject_complex_dag(
         tflite_path: str = "snn.tflite"
 ) -> None:
     """
-    Executes the clean, step-by-step pipeline to transform a Nengo DAG into a
-    hardware-ready custom TFLite model configuration.
+    Executes the step-by-step translation pipeline to transform a Nengo DAG into a
+    hardware-ready custom TFLite model flatbuffer architecture.
     """
-    # Step 1: Translate Nengo structure to Keras architecture
+    # Step 1: Translate Nengo structure to unique-named Keras architecture
     keras_model = build_keras_model_from_nengo(sim, network, start_nodes, output_nodes)
     print("[Pipeline] Keras structural translation complete.")
 
-    # Step 2: Inform the local process environment about our hardware op mapping
+    # Step 2: Inform the active process environment about our hardware op mappings
     register_custom_hardware_op(custom_op_name)
 
-    # Use a secure contextual memory scope for temporary translation artifacts
+    # Use a secure contextual memory scope for temporary disk serialization
     temp_dir = tempfile.mkdtemp()
     try:
         # Step 3: Export temporary disk blueprints to unlock Protobuf access
         keras_model.save(temp_dir)
 
-        # Step 4: Run the deep-graph patcher
+        # Step 4: Run the deep-graph patcher (Swaps placeholder ops for custom hardware designations)
         patches = patch_saved_model_protobuf(temp_dir, target_namespace, placeholder_op, custom_op_name)
-        print(f"[Pipeline] Deep patch complete. Mutated {patches} nodes to '{custom_op_name}'.")
+        print(f"[Pipeline] Deep patch complete. Mutated {patches} nodes to hardware operations.")
 
-        # Step 5: Convert the modified model layout to TFLite
+        # Step 5: Convert the modified graph definition directly to TFLite
         compile_saved_model_to_tflite(temp_dir, tflite_path)
         print(f"[Pipeline] Success! Final compiled binary delivered to -> {tflite_path}")
 
+        # Step 6: Generate matching header configuration records via external template file
+        output_directory = os.path.dirname(tflite_path) or "."
+        generate_hardware_header_from_template(network, output_directory)
+
     finally:
-        # Step 6: Guarantee temp folder cleanup regardless of execution success state
+        # Step 7: Guarantee clean deletion of local scratch paths upon conclusion
         shutil.rmtree(temp_dir)

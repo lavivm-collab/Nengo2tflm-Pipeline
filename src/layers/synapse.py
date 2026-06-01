@@ -2,26 +2,50 @@ import nengo
 import numpy as np
 import tensorflow as tf
 
-# 1. The Keras "Stub" for the Synapse Op
+
 @tf.keras.utils.register_keras_serializable()
 class SynapseFilterLayer(tf.keras.layers.Layer):
-    def __init__(self, tau=0.01, dt=0.001, **kwargs):
+    def __init__(self, tau=0.01, dt=0.001, size_in=1, **kwargs):
         super(SynapseFilterLayer, self).__init__(**kwargs)
-        self.tau, self.dt = tau, dt
-    def call(self, inputs): return tf.identity(inputs)
+        self.tau = float(tau)
+        self.dt = float(dt)
+        self.size_in = int(size_in)
+
+    def call(self, inputs):
+        # Use Cosine as a 1-to-1 placeholder!
+        # TFLite won't optimize it away, and it maps perfectly to our 1-input custom op.
+        return tf.math.cos(inputs)
+
     def get_config(self):
         config = super().get_config()
-        config.update({"tau": self.tau, "dt": self.dt})
+        config.update({
+            "tau": self.tau,
+            "dt": self.dt,
+            "size_in": self.size_in
+        })
         return config
 
 
-# 2. The Custom Nengo Component
 class HardwareConnection(nengo.Connection):
     def to_keras(self, sim):
-        W = sim.data[self].weights.T
-        B = np.zeros(self.post.size_in)
+        nengo_weights = sim.data[self].weights
+        if nengo_weights is None:
+            W = np.eye(self.post.size_in, self.pre.size_out, dtype=np.float32)
+        else:
+            W = nengo_weights.T
+
+        B = np.zeros(self.post.size_in, dtype=np.float32)
         tau = self.synapse.tau if hasattr(self.synapse, 'tau') else 0.01
 
-        decoder_dense = tf.keras.layers.Dense(self.post.size_in, name=f'Decoders_to_{self.post.label}')
-        hardware_synapse = SynapseFilterLayer(tau=tau, dt=0.001, name=f'Hardware_Synapse')
+        pre_label = (self.pre.label or f"node_{id(self.pre)}").replace(" ", "_")
+        post_label = (self.post.label or f"node_{id(self.post)}").replace(" ", "_")
+
+        decoder_dense = tf.keras.layers.Dense(self.post.size_in, name=f'Decoders_{pre_label}_to_{post_label}')
+
+        hardware_synapse = SynapseFilterLayer(
+            tau=tau,
+            dt=0.001,
+            size_in=self.pre.size_out,
+            name=f'Hardware_Synapse_{pre_label}_to_{post_label}'
+        )
         return [decoder_dense, hardware_synapse], [W, B]

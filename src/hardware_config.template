@@ -1,0 +1,32 @@
+#ifndef HARDWARE_CONFIG_H
+#define HARDWARE_CONFIG_H
+
+#include <cstdint>
+
+struct HardwareLIFConfig {
+    const char* label;
+    int32_t n_neurons;
+    int32_t dimensions;
+    float tau_rc;
+    float tau_ref;
+    float v_threshold;
+};
+
+struct HardwareSynapseConfig {
+    const char* pre_label;
+    const char* post_label;
+    float tau;
+};
+
+#define NUM_HARDWARE_ENSEMBLES {NUM_ENSEMBLES}
+#define NUM_HARDWARE_SYNAPSES {NUM_SYNAPSES}
+
+const HardwareLIFConfig hardware_ensembles[NUM_HARDWARE_ENSEMBLES] = {
+{ENSEMBLE_ENTRIES}
+};
+
+const HardwareSynapseConfig hardware_synapses[NUM_HARDWARE_SYNAPSES] = {
+{SYNAPSE_ENTRIES}
+};
+
+#endif // HARDWARE_CONFIG_H
