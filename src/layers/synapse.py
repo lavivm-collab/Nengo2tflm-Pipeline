@@ -28,6 +28,7 @@ class SynapseFilterLayer(tf.keras.layers.Layer):
 
 class HardwareConnection(nengo.Connection):
     def to_keras(self, sim):
+        # 1. Extract or generate weights
         nengo_weights = sim.data[self].weights
         if nengo_weights is None:
             W = np.eye(self.post.size_in, self.pre.size_out, dtype=np.float32)
@@ -35,17 +36,30 @@ class HardwareConnection(nengo.Connection):
             W = nengo_weights.T
 
         B = np.zeros(self.post.size_in, dtype=np.float32)
-        tau = self.synapse.tau if hasattr(self.synapse, 'tau') else 0.01
 
+        # 2. Format names safely
         pre_label = (self.pre.label or f"node_{id(self.pre)}").replace(" ", "_")
         post_label = (self.post.label or f"node_{id(self.post)}").replace(" ", "_")
 
-        decoder_dense = tf.keras.layers.Dense(self.post.size_in, name=f'Decoders_{pre_label}_to_{post_label}')
-
-        hardware_synapse = SynapseFilterLayer(
-            tau=tau,
-            dt=0.001,
-            size_in=self.pre.size_out,
-            name=f'Hardware_Synapse_{pre_label}_to_{post_label}'
+        # 3. Always instantiate the decoder Dense layer
+        decoder_dense = tf.keras.layers.Dense(
+            self.post.size_in,
+            name=f'Decoders_{pre_label}_to_{post_label}'
         )
-        return [decoder_dense, hardware_synapse], [W, B]
+
+        # Start our layers array with just the dense layer
+        layers = [decoder_dense]
+
+        # 4. DYNAMIC FIX: Only instantiate and add the synapse layer if a synapse exists
+        if self.synapse is not None and hasattr(self.synapse, 'tau'):
+            tau = float(self.synapse.tau)
+            hardware_synapse = SynapseFilterLayer(
+                tau=tau,
+                dt=0.001,
+                size_in=self.pre.size_out,
+                name=f'Hardware_Synapse_{pre_label}_to_{post_label}'
+            )
+            layers.append(hardware_synapse)
+
+        # Return the dynamically built layers list along with the weights
+        return layers, [W, B]
