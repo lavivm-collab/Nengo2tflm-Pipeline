@@ -58,9 +58,8 @@ def topological_sort_and_detect_loops(network: nengo.Network) -> List[Union[neng
 
 def collect_ensemble_params(sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]]) -> List[Dict[str, Any]]:
     """
-    Extracts per-ensemble neuron-model constants (tau_rc, tau_ref, v_threshold). Shared by
-    the protobuf attribute patcher (Stage 3) and the C++ header generator (Stage 4) so both
-    outputs are always built from the same solved values.
+    Extracts per-ensemble neuron-model constants (tau_rc, tau_ref, v_threshold), used by the
+    protobuf attribute patcher (Stage 3) to stamp each op with its own solved values.
     """
     ensembles_found = []
     for obj in sorted_nodes:
@@ -82,8 +81,8 @@ def collect_ensemble_params(sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]
 
 def collect_synapse_params(network: nengo.Network) -> List[Dict[str, Any]]:
     """
-    Extracts per-connection synaptic filter constants (tau). Shared by the protobuf
-    attribute patcher (Stage 3) and the C++ header generator (Stage 4).
+    Extracts per-connection synaptic filter constants (tau), used by the protobuf
+    attribute patcher (Stage 3) to stamp each op with its own solved values.
     """
     synapses_found = []
     for conn in network.all_connections:
@@ -323,65 +322,7 @@ def compile_saved_model_to_tflite(saved_model_dir: str, tflite_path: str) -> Non
 
 
 # =====================================================================
-# STAGE 4: EMBEDDED C++ CONFIGURATION HEADER COMPILER
-# =====================================================================
-
-def generate_hardware_header_from_template(
-        network: nengo.Network,
-        output_dir: str,
-        sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]],
-        dt: float,
-        template_name: str = "hardware_config.template"
-) -> None:
-    """
-    Parses structural parameters from Nengo objects (constants like tau and physical thresholds),
-    populating an edge-compilation C++ static array runtime configuration header file.
-    """
-    # 1. Gather Physical Ensemble and Synaptic Filter Constants
-    ensembles_found = collect_ensemble_params(sorted_nodes)
-    synapses_found = collect_synapse_params(network)
-
-    # 2. Locate and Read Template File
-    template_path = os.path.join(os.path.dirname(__file__), template_name)
-    if not os.path.exists(template_path):
-        template_path = template_name
-
-    if not os.path.exists(template_path):
-        print(f"[Template Engine] Warning: Could not locate '{template_name}'. Skipping C++ header export.")
-        return
-
-    with open(template_path, "r") as f:
-        template_content = f.read()
-
-    # 3. Generate C++ Initialization Rows for Output Struct Arrays
-    ens_lines = [
-        f'    {{ "{e["label"]}", {e["neurons"]}, {e["dimensions"]}, {e["tau_rc"]:.6f}f, {e["tau_ref"]:.6f}f, {e["v_threshold"]:.1f}f }}'
-        for e in ensembles_found
-    ]
-    ens_entries_str = ",\n".join(ens_lines)
-
-    syn_lines = [
-        f'    {{ "{s["pre_label"]}", "{s["post_label"]}", {s["tau"]:.6f}f }}'
-        for s in synapses_found
-    ]
-    syn_entries_str = ",\n".join(syn_lines)
-
-    # 4. Populate Structural Fields into Target Format Output File
-    final_output = template_content.replace("{NUM_ENSEMBLES}", str(len(ensembles_found)))
-    final_output = final_output.replace("{ENSEMBLE_ENTRIES}", ens_entries_str)
-    final_output = final_output.replace("{NUM_SYNAPSES}", str(len(synapses_found)))
-    final_output = final_output.replace("{SYNAPSE_ENTRIES}", syn_entries_str)
-    final_output = final_output.replace("{SIM_DT}", f"{dt:.6f}")
-
-    h_file_path = os.path.join(output_dir, "hardware_config.h")
-    with open(h_file_path, "w") as f:
-        f.write(final_output)
-
-    print(f"[Template Engine] Statically compiled hardware properties saved to -> {h_file_path}")
-
-
-# =====================================================================
-# STAGE 5: INTEGRATED PIPELINE PIPELINE ORCHESTRATOR
+# STAGE 4: INTEGRATED PIPELINE ORCHESTRATOR
 # =====================================================================
 
 def convert_and_inject_complex_dag(
@@ -406,7 +347,7 @@ def convert_and_inject_complex_dag(
     # Step 2: Custom Op Environment Signatures Registration
     register_custom_hardware_op(custom_op_name)
 
-    # Collect the same solved constants once, shared by the protobuf patcher and the header
+    # Collect the solved neuron/synapse constants once, stamped onto their ops in Step 4
     ensembles = collect_ensemble_params(sorted_nodes)
     synapses = collect_synapse_params(network)
 
@@ -416,7 +357,8 @@ def convert_and_inject_complex_dag(
         # Step 3: Serialize unpatched model configuration structures to storage disk
         keras_model.save(temp_dir)
 
-        # Step 4: Run Protobuf Deep-Patcher tool to map hardware execution ops
+        # Step 4: Run Protobuf Deep-Patcher tool to map hardware execution ops and stamp
+        # each patched op with its solved neuron/synapse constants as real op attrs
         patches = patch_saved_model_protobuf(
             temp_dir, target_namespace, placeholder_op, custom_op_name,
             ensembles, synapses, sim.dt
@@ -427,10 +369,6 @@ def convert_and_inject_complex_dag(
         compile_saved_model_to_tflite(temp_dir, tflite_path)
         print(f"[Pipeline] Success! Final compiled binary delivered to -> {tflite_path}")
 
-        # Step 6: Export C++ parameters header file
-        output_directory = os.path.dirname(tflite_path) or "."
-        generate_hardware_header_from_template(network, output_directory, sorted_nodes, sim.dt)
-
     finally:
-        # Step 7: Clear out temporary scratchpad workspace assets from filesystem
+        # Step 6: Clear out temporary scratchpad workspace assets from filesystem
         shutil.rmtree(temp_dir)

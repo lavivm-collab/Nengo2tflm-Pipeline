@@ -6,14 +6,14 @@ The goal of this project is a low-overhead, hardware-software framework for depl
 Neural Networks (SNNs) on resource-constrained RISC-V edge devices, without the memory or power
 overhead of a traditional OS. This repository holds **Phase 1**: a compiler pipeline that
 converts [Nengo](https://www.nengo.ai/) SNN models into a bare-metal-deployable artifact — a
-TensorFlow Lite Micro (`.tflite`) flatbuffer plus a generated C++ configuration header —
-targeting custom hardware LIF/synapse microkernels.
+self-contained TensorFlow Lite Micro (`.tflite`) flatbuffer, with all neuron/synapse constants
+embedded directly in it — targeting custom hardware LIF/synapse microkernels.
 
 ## How it works
 
 Nengo builds SNNs as a graph of `Ensemble`s (populations of spiking neurons) and `Node`s
 (inputs/outputs), linked by `Connection`s. The converter ([`src/converter.py`](src/converter.py))
-turns that graph into a deployment bundle in five stages:
+turns that graph into a deployment bundle in four stages:
 
 1. **Topological sort & loop detection** — Kahn's algorithm orders the Nengo DAG. Since TFLM
    cannot route recurrent memory loops as native graph edges, any cycle in the network raises a
@@ -25,14 +25,15 @@ turns that graph into a deployment bundle in five stages:
    is walked and placeholder ops are swapped for custom hardware op names (`Sin` →
    `LIFSpikeLayer`, `Cos` → `HardwareSynapseLayer`). Placeholder math ops are used during
    modeling because TFLite's converter would otherwise constant-fold or reject unrecognized ops;
-   swapping happens after Keras has done its shape/weight bookkeeping.
+   swapping happens after Keras has done its shape/weight bookkeeping. Each patched op is also
+   matched to its source ensemble/connection and stamped with its solved constants (`tau_rc`,
+   `tau_ref`, `v_threshold`, `tau`, and the simulation `dt`) as real op attrs — these survive into
+   the final flatbuffer's `custom_options` (a FlexBuffer a TFLM kernel can read at `Init()`), which
+   requires declaring them in the registered OpDef itself; attrs set only on the graph node without
+   a matching OpDef declaration are silently dropped during conversion.
 4. **TFLite compilation** — the patched `SavedModel` is compiled to a `.tflite` flatbuffer with
-   `allow_custom_ops=True` and no graph optimizations, so the hardware op nodes and structure
-   survive intact for the target runtime to load.
-5. **Hardware header generation** — per-ensemble (`tau_rc`, `tau_ref`, threshold, neuron/dim
-   counts) and per-synapse (`tau`) parameters are extracted from the Nengo model and rendered into
-   a static `hardware_config.h` via [`src/hardware_config.template`](src/hardware_config.template),
-   for the embedded runtime to consume at compile time.
+   `allow_custom_ops=True` and no graph optimizations, so the hardware op nodes, their structure,
+   and their embedded per-op constants survive intact for the target runtime to load.
 
 ### Custom hardware-mapped Nengo objects
 
@@ -48,8 +49,9 @@ turns that graph into a deployment bundle in five stages:
 [`src/two_neurons.py`](src/two_neurons.py) builds a small `Input Node -> HardwareLIFEnsemble(2) ->
 HardwareConnection -> Output Node` network, runs a reference Nengo simulation (used to solve
 weights and to plot ground-truth spikes/voltage/decoded output), and then calls
-`convert_and_inject_complex_dag(...)` to produce `src/dest/two_neurons.tflite` and
-`src/dest/hardware_config.h`.
+`convert_and_inject_complex_dag(...)` to produce `src/dest/two_neurons.tflite`.
+[`src/two_neurons_2d.py`](src/two_neurons_2d.py) is the same example with a 2-dimensional
+ensemble instead of 1D, verifying the pipeline generalizes beyond scalar representations.
 
 ```bash
 cd src
@@ -61,12 +63,12 @@ python two_neurons.py
 ```
 src/
   converter.py                Nengo -> Keras -> TFLite conversion pipeline
-  hardware_config.template    Template for the generated C++ hardware config header
-  two_neurons.py               Example / integration script
+  two_neurons.py               Example / integration script (1D)
+  two_neurons_2d.py            Same example with a 2D ensemble
   layers/
     spike_lif.py               HardwareLIFEnsemble + LIFSpikeLayer (Sin placeholder)
     synapse.py                  HardwareConnection + SynapseFilterLayer (Cos placeholder)
-  dest/                        Generated output (.tflite + hardware_config.h), gitignored
+  dest/                        Generated .tflite output, gitignored
 ```
 
 ## Requirements
@@ -80,8 +82,8 @@ No `requirements.txt` exists yet — install the packages above into your enviro
 
 ## Status & roadmap
 
-- ✅ **Phase 1 — Compiler pipeline** (this repo): Nengo DAG → Keras → patched `.tflite` +
-  generated hardware config header.
+- ✅ **Phase 1 — Compiler pipeline** (this repo): Nengo DAG → Keras → patched, self-describing
+  `.tflite` (neuron/synapse constants embedded as custom-op attrs, no separate config file).
 - ⏳ **Phase 2 — Bare-metal exploration & microkernel optimization**: implement the actual
   `LIFSpikeLayer`/`HardwareSynapseLayer` TFLM C++ kernels (`Init`/`Prepare`/`Invoke`, static
   tensor-arena state for membrane voltage and refractory counters, no heap allocation), a
@@ -95,3 +97,7 @@ No `requirements.txt` exists yet — install the packages above into your enviro
   refractory counters) is tracked inside operator state, not the graph.
 - `Invoke` execution loops should stay structured and explicit so blocks can later be swapped for
   RISC-V vector extension (RVV) or MMIO accelerator commands.
+- Per-op configuration (`tau_rc`, `tau_ref`, `v_threshold`, `tau`, `dt`) is not passed as a
+  separate file — it's read from each op's `custom_options` FlexBuffer at `Init()` time (e.g. via
+  `flexbuffers::GetRoot(buffer, length).AsMap()["tau_rc"].AsFloat()`), same as any standard TFLite
+  custom op.
