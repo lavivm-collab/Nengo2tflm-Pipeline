@@ -20,6 +20,7 @@ struct HardwareSynapseConfig {
 
 #define NUM_HARDWARE_ENSEMBLES {NUM_ENSEMBLES}
 #define NUM_HARDWARE_SYNAPSES {NUM_SYNAPSES}
+#define HARDWARE_SIM_DT_SECONDS {SIM_DT}f
 
 const HardwareLIFConfig hardware_ensembles[NUM_HARDWARE_ENSEMBLES] = {
 {ENSEMBLE_ENTRIES}

@@ -5,6 +5,7 @@ from typing import List, Union, Dict, Any
 import nengo
 import tensorflow as tf
 from tensorflow.core.protobuf import saved_model_pb2
+from tensorflow.core.framework import attr_value_pb2
 
 
 # =====================================================================
@@ -49,6 +50,54 @@ def topological_sort_and_detect_loops(network: nengo.Network) -> List[Union[neng
         )
 
     return execution_order
+
+
+# =====================================================================
+# STAGE 1b: SHARED HARDWARE PARAMETER EXTRACTION
+# =====================================================================
+
+def collect_ensemble_params(sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]]) -> List[Dict[str, Any]]:
+    """
+    Extracts per-ensemble neuron-model constants (tau_rc, tau_ref, v_threshold). Shared by
+    the protobuf attribute patcher (Stage 3) and the C++ header generator (Stage 4) so both
+    outputs are always built from the same solved values.
+    """
+    ensembles_found = []
+    for obj in sorted_nodes:
+        if obj.__class__.__name__ == "HardwareLIFEnsemble" or hasattr(obj, 'neuron_type'):
+            tau_rc = getattr(obj.neuron_type, 'tau_rc', 0.02)
+            tau_ref = getattr(obj.neuron_type, 'tau_ref', 0.002)
+            v_threshold = 1.0
+
+            ensembles_found.append({
+                "label": (obj.label or f"ensemble_{id(obj)}").replace(" ", "_"),
+                "neurons": obj.n_neurons,
+                "dimensions": obj.dimensions,
+                "tau_rc": float(tau_rc),
+                "tau_ref": float(tau_ref),
+                "v_threshold": float(v_threshold)
+            })
+    return ensembles_found
+
+
+def collect_synapse_params(network: nengo.Network) -> List[Dict[str, Any]]:
+    """
+    Extracts per-connection synaptic filter constants (tau). Shared by the protobuf
+    attribute patcher (Stage 3) and the C++ header generator (Stage 4).
+    """
+    synapses_found = []
+    for conn in network.all_connections:
+        if hasattr(conn, 'synapse') and hasattr(conn.synapse, 'tau'):
+            pre_label = (conn.pre.label or f"node_{id(conn.pre)}").replace(" ", "_")
+            post_label = (conn.post.label or f"node_{id(conn.post)}").replace(" ", "_")
+            tau = float(conn.synapse.tau)
+
+            synapses_found.append({
+                "pre_label": pre_label,
+                "post_label": post_label,
+                "tau": tau
+            })
+    return synapses_found
 
 
 # =====================================================================
@@ -151,17 +200,29 @@ def register_custom_hardware_op(custom_op_name: str) -> None:
     """
     Registers custom hardware execution primitives into the active TensorFlow process
     environment context to defend against graph loading parsing crashes.
+
+    Declaring the neuron/synapse constants as real `attr` fields (not just setting them on
+    the NodeDef later) is what makes them survive into the TFLite flatbuffer's
+    custom_options: an unregistered NodeDef attr gets silently dropped during conversion
+    ("Unknown attributes will be ignored"), but a declared one gets packed into a real
+    FlexBuffer that a TFLM kernel can read at Init() time.
     """
     synapse_opdef = (
         "name: 'HardwareSynapseLayer'\n"
         "input_arg: { name: 'x' type: DT_FLOAT }\n"
-        "output_arg: { name: 'y' type: DT_FLOAT }"
+        "output_arg: { name: 'y' type: DT_FLOAT }\n"
+        "attr: { name: 'tau' type: 'float' default_value: { f: 0.01 } }\n"
+        "attr: { name: 'dt' type: 'float' default_value: { f: 0.001 } }"
     )
 
     lif_opdef = (
         f"name: '{custom_op_name}'\n"
         f"input_arg: {{ name: 'x' type: DT_FLOAT }}\n"
-        f"output_arg: {{ name: 'y' type: DT_FLOAT }}"
+        f"output_arg: {{ name: 'y' type: DT_FLOAT }}\n"
+        f"attr: {{ name: 'tau_rc' type: 'float' default_value: {{ f: 0.02 }} }}\n"
+        f"attr: {{ name: 'tau_ref' type: 'float' default_value: {{ f: 0.002 }} }}\n"
+        f"attr: {{ name: 'v_threshold' type: 'float' default_value: {{ f: 1.0 }} }}\n"
+        f"attr: {{ name: 'dt' type: 'float' default_value: {{ f: 0.001 }} }}"
     )
 
     try:
@@ -176,11 +237,17 @@ def patch_saved_model_protobuf(
         saved_model_dir: str,
         target_namespace: str,
         placeholder_op: str,
-        custom_op_name: str
+        custom_op_name: str,
+        ensembles: List[Dict[str, Any]],
+        synapses: List[Dict[str, Any]],
+        dt: float
 ) -> int:
     """
     Surgically audits SavedModel serialized binary charts, swapping baseline mathematical
-    placeholders (Sin/Cos) with target downstream hardware microkernel assignments.
+    placeholders (Sin/Cos) with target downstream hardware microkernel assignments, and
+    stamps each patched node with its solved neuron/synapse constants (plus the global
+    simulation timestep) as real op attrs, so a TFLM kernel can read its own configuration
+    directly from custom_options instead of needing a separately-matched header entry.
     """
     saved_model_path = os.path.join(saved_model_dir, "saved_model.pb")
     sm = saved_model_pb2.SavedModel()
@@ -190,17 +257,38 @@ def patch_saved_model_protobuf(
 
     patch_count = 0
 
+    def set_float_attr(node, attr_name: str, value: float) -> None:
+        node.attr[attr_name].CopyFrom(attr_value_pb2.AttrValue(f=float(value)))
+
     # Unified internal worker function to update computational nodes
     def patch_node_list(nodes):
         nonlocal patch_count
         for node in nodes:
-            # Swap Sine operations matching our target namespace namespace with custom LIF layer ops
-            if target_namespace.lower() in node.name.lower() and node.op == placeholder_op:
+            name_lower = node.name.lower()
+
+            # Swap Sine operations matching our target namespace with custom LIF layer ops
+            if target_namespace.lower() in name_lower and node.op == placeholder_op:
                 node.op = custom_op_name
+                # Identify which specific ensemble this node belongs to by label match,
+                # so a multi-ensemble network doesn't get one ensemble's tau on every node.
+                for ensemble in ensembles:
+                    if ensemble["label"].lower() in name_lower:
+                        set_float_attr(node, "tau_rc", ensemble["tau_rc"])
+                        set_float_attr(node, "tau_ref", ensemble["tau_ref"])
+                        set_float_attr(node, "v_threshold", ensemble["v_threshold"])
+                        break
+                set_float_attr(node, "dt", dt)
                 patch_count += 1
+
             # Swap Cosine operations within synapse containers with custom Synapse layer ops
-            elif "hardware_synapse" in node.name.lower() and node.op == "Cos":
+            elif "hardware_synapse" in name_lower and node.op == "Cos":
                 node.op = "HardwareSynapseLayer"
+                for synapse in synapses:
+                    synapse_name = f"hardware_synapse_{synapse['pre_label']}_to_{synapse['post_label']}".lower()
+                    if synapse_name in name_lower:
+                        set_float_attr(node, "tau", synapse["tau"])
+                        break
+                set_float_attr(node, "dt", dt)
                 patch_count += 1
 
     for meta_graph in sm.meta_graphs:
@@ -242,44 +330,18 @@ def generate_hardware_header_from_template(
         network: nengo.Network,
         output_dir: str,
         sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]],
+        dt: float,
         template_name: str = "hardware_config.template"
 ) -> None:
     """
     Parses structural parameters from Nengo objects (constants like tau and physical thresholds),
     populating an edge-compilation C++ static array runtime configuration header file.
     """
-    # 1. Gather Physical Ensemble Constants
-    ensembles_found = []
-    for obj in sorted_nodes:
-        if obj.__class__.__name__ == "HardwareLIFEnsemble" or hasattr(obj, 'neuron_type'):
-            tau_rc = getattr(obj.neuron_type, 'tau_rc', 0.02)
-            tau_ref = getattr(obj.neuron_type, 'tau_ref', 0.002)
-            v_threshold = 1.0
+    # 1. Gather Physical Ensemble and Synaptic Filter Constants
+    ensembles_found = collect_ensemble_params(sorted_nodes)
+    synapses_found = collect_synapse_params(network)
 
-            ensembles_found.append({
-                "label": (obj.label or f"ensemble_{id(obj)}").replace(" ", "_"),
-                "neurons": obj.n_neurons,
-                "dimensions": obj.dimensions,
-                "tau_rc": float(tau_rc),
-                "tau_ref": float(tau_ref),
-                "v_threshold": float(v_threshold)
-            })
-
-    # 2. Gather Physical Synaptic Filter Constants
-    synapses_found = []
-    for conn in network.all_connections:
-        if hasattr(conn, 'synapse') and hasattr(conn.synapse, 'tau'):
-            pre_label = (conn.pre.label or f"node_{id(conn.pre)}").replace(" ", "_")
-            post_label = (conn.post.label or f"node_{id(conn.post)}").replace(" ", "_")
-            tau = float(conn.synapse.tau)
-
-            synapses_found.append({
-                "pre_label": pre_label,
-                "post_label": post_label,
-                "tau": tau
-            })
-
-    # 3. Locate and Read Template File
+    # 2. Locate and Read Template File
     template_path = os.path.join(os.path.dirname(__file__), template_name)
     if not os.path.exists(template_path):
         template_path = template_name
@@ -291,7 +353,7 @@ def generate_hardware_header_from_template(
     with open(template_path, "r") as f:
         template_content = f.read()
 
-    # 4. Generate C++ Initialization Rows for Output Struct Arrays
+    # 3. Generate C++ Initialization Rows for Output Struct Arrays
     ens_lines = [
         f'    {{ "{e["label"]}", {e["neurons"]}, {e["dimensions"]}, {e["tau_rc"]:.6f}f, {e["tau_ref"]:.6f}f, {e["v_threshold"]:.1f}f }}'
         for e in ensembles_found
@@ -304,11 +366,12 @@ def generate_hardware_header_from_template(
     ]
     syn_entries_str = ",\n".join(syn_lines)
 
-    # 5. Populate Structural Fields into Target Format Output File
+    # 4. Populate Structural Fields into Target Format Output File
     final_output = template_content.replace("{NUM_ENSEMBLES}", str(len(ensembles_found)))
     final_output = final_output.replace("{ENSEMBLE_ENTRIES}", ens_entries_str)
     final_output = final_output.replace("{NUM_SYNAPSES}", str(len(synapses_found)))
     final_output = final_output.replace("{SYNAPSE_ENTRIES}", syn_entries_str)
+    final_output = final_output.replace("{SIM_DT}", f"{dt:.6f}")
 
     h_file_path = os.path.join(output_dir, "hardware_config.h")
     with open(h_file_path, "w") as f:
@@ -343,6 +406,10 @@ def convert_and_inject_complex_dag(
     # Step 2: Custom Op Environment Signatures Registration
     register_custom_hardware_op(custom_op_name)
 
+    # Collect the same solved constants once, shared by the protobuf patcher and the header
+    ensembles = collect_ensemble_params(sorted_nodes)
+    synapses = collect_synapse_params(network)
+
     # Use secure sandbox memory allocation context for disk-based transformation steps
     temp_dir = tempfile.mkdtemp()
     try:
@@ -350,7 +417,10 @@ def convert_and_inject_complex_dag(
         keras_model.save(temp_dir)
 
         # Step 4: Run Protobuf Deep-Patcher tool to map hardware execution ops
-        patches = patch_saved_model_protobuf(temp_dir, target_namespace, placeholder_op, custom_op_name)
+        patches = patch_saved_model_protobuf(
+            temp_dir, target_namespace, placeholder_op, custom_op_name,
+            ensembles, synapses, sim.dt
+        )
         print(f"[Pipeline] Deep patch complete. Mutated {patches} nodes to hardware operations.")
 
         # Step 5: Final flatbuffer generation
@@ -359,7 +429,7 @@ def convert_and_inject_complex_dag(
 
         # Step 6: Export C++ parameters header file
         output_directory = os.path.dirname(tflite_path) or "."
-        generate_hardware_header_from_template(network, output_directory, sorted_nodes)
+        generate_hardware_header_from_template(network, output_directory, sorted_nodes, sim.dt)
 
     finally:
         # Step 7: Clear out temporary scratchpad workspace assets from filesystem
