@@ -59,7 +59,8 @@ def build_keras_model_from_nengo(
         sim: nengo.Simulator,
         network: nengo.Network,
         start_nodes: Union[nengo.Node, List[nengo.Node]],
-        output_nodes: Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]]
+        output_nodes: Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]],
+        sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]]
 ) -> tf.keras.Model:
     """
     Parses a validated Nengo DAG and compiles it sequentially into an executable
@@ -68,7 +69,6 @@ def build_keras_model_from_nengo(
     start_list = start_nodes if isinstance(start_nodes, list) else [start_nodes]
     output_list = output_nodes if isinstance(output_nodes, list) else [output_nodes]
 
-    sorted_nodes = topological_sort_and_detect_loops(network)
     tensor_map: Dict[Union[nengo.Ensemble, nengo.Node], tf.Tensor] = {}
     input_tensors: List[tf.Tensor] = []
 
@@ -241,14 +241,13 @@ def compile_saved_model_to_tflite(saved_model_dir: str, tflite_path: str) -> Non
 def generate_hardware_header_from_template(
         network: nengo.Network,
         output_dir: str,
+        sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]],
         template_name: str = "hardware_config.template"
 ) -> None:
     """
     Parses structural parameters from Nengo objects (constants like tau and physical thresholds),
     populating an edge-compilation C++ static array runtime configuration header file.
     """
-    sorted_nodes = topological_sort_and_detect_loops(network)
-
     # 1. Gather Physical Ensemble Constants
     ensembles_found = []
     for obj in sorted_nodes:
@@ -337,7 +336,8 @@ def convert_and_inject_complex_dag(
     into a custom hardware-accelerated TFLite deployment bundle.
     """
     # Step 1: Model conversion
-    keras_model = build_keras_model_from_nengo(sim, network, start_nodes, output_nodes)
+    sorted_nodes = topological_sort_and_detect_loops(network)
+    keras_model = build_keras_model_from_nengo(sim, network, start_nodes, output_nodes, sorted_nodes)
     print("[Pipeline] Keras structural translation complete.")
 
     # Step 2: Custom Op Environment Signatures Registration
@@ -359,7 +359,7 @@ def convert_and_inject_complex_dag(
 
         # Step 6: Export C++ parameters header file
         output_directory = os.path.dirname(tflite_path) or "."
-        generate_hardware_header_from_template(network, output_directory)
+        generate_hardware_header_from_template(network, output_directory, sorted_nodes)
 
     finally:
         # Step 7: Clear out temporary scratchpad workspace assets from filesystem
