@@ -1,37 +1,45 @@
 import os
 import tempfile
 import shutil
-from typing import List, Union, Dict, Any
+from collections import deque
+from typing import List, Union, Dict, Any, Deque
 import nengo
 import tensorflow as tf
 from tensorflow.core.protobuf import saved_model_pb2
 from tensorflow.core.framework import attr_value_pb2
+
+# A component of the Nengo DAG we compile: either a population of neurons or an
+# input/output port. Used throughout instead of repeating the Union inline, which had
+# already drifted inconsistent (some signatures wrote it as Union[Node, Ensemble] instead).
+NengoGraphObject = Union[nengo.Ensemble, nengo.Node]
 
 
 # =====================================================================
 # STAGE 1: GRAPH TOPOLOGY & LOOP VALIDATION
 # =====================================================================
 
-def topological_sort_and_detect_loops(network: nengo.Network) -> List[Union[nengo.Ensemble, nengo.Node]]:
+def topological_sort_and_detect_loops(network: nengo.Network) -> List[NengoGraphObject]:
     """
     Performs a topological sort on Nengo network components using Kahn's Algorithm.
     Protects the deployment target by aborting if an un-routable recurrent cycle is detected.
     """
-    all_objects: List[Union[nengo.Ensemble, nengo.Node]] = network.all_ensembles + network.all_nodes
-    adj: Dict[Union[nengo.Ensemble, nengo.Node], List[nengo.Connection]] = {obj: [] for obj in all_objects}
-    in_degree: Dict[Union[nengo.Ensemble, nengo.Node], int] = {obj: 0 for obj in all_objects}
+    all_objects: List[NengoGraphObject] = network.all_ensembles + network.all_nodes
+    adj: Dict[NengoGraphObject, List[nengo.Connection]] = {obj: [] for obj in all_objects}
+    in_degree: Dict[NengoGraphObject, int] = {obj: 0 for obj in all_objects}
 
     # Build adjacency listing and track entry degrees
     for conn in network.all_connections:
         adj[conn.pre].append(conn)
         in_degree[conn.post] += 1
 
-    # Queue root independent components (nodes/ensembles with 0 incoming dependencies)
-    queue: List[Union[nengo.Ensemble, nengo.Node]] = [obj for obj, deg in in_degree.items() if deg == 0]
-    execution_order: List[Union[nengo.Ensemble, nengo.Node]] = []
+    # Queue root independent components (nodes/ensembles with 0 incoming dependencies).
+    # deque + popleft() keeps this an O(1)-per-pop FIFO queue; list + pop(0) would be O(n)
+    # per pop (shifts every remaining element), making the whole sort O(n^2).
+    queue: Deque[NengoGraphObject] = deque(obj for obj, deg in in_degree.items() if deg == 0)
+    execution_order: List[NengoGraphObject] = []
 
     while queue:
-        curr = queue.pop(0)
+        curr = queue.popleft()
         execution_order.append(curr)
 
         for conn in adj[curr]:
@@ -56,7 +64,7 @@ def topological_sort_and_detect_loops(network: nengo.Network) -> List[Union[neng
 # STAGE 1b: SHARED HARDWARE PARAMETER EXTRACTION
 # =====================================================================
 
-def collect_ensemble_params(sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]]) -> List[Dict[str, Any]]:
+def collect_ensemble_params(sorted_nodes: List[NengoGraphObject]) -> List[Dict[str, Any]]:
     """
     Extracts per-ensemble neuron-model constants (tau_rc, tau_ref, v_threshold), used by the
     protobuf attribute patcher (Stage 3) to stamp each op with its own solved values.
@@ -107,8 +115,8 @@ def build_keras_model_from_nengo(
         sim: nengo.Simulator,
         network: nengo.Network,
         start_nodes: Union[nengo.Node, List[nengo.Node]],
-        output_nodes: Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]],
-        sorted_nodes: List[Union[nengo.Ensemble, nengo.Node]]
+        output_nodes: Union[NengoGraphObject, List[NengoGraphObject]],
+        sorted_nodes: List[NengoGraphObject]
 ) -> tf.keras.Model:
     """
     Parses a validated Nengo DAG and compiles it sequentially into an executable
@@ -117,7 +125,7 @@ def build_keras_model_from_nengo(
     start_list = start_nodes if isinstance(start_nodes, list) else [start_nodes]
     output_list = output_nodes if isinstance(output_nodes, list) else [output_nodes]
 
-    tensor_map: Dict[Union[nengo.Ensemble, nengo.Node], tf.Tensor] = {}
+    tensor_map: Dict[NengoGraphObject, tf.Tensor] = {}
     input_tensors: List[tf.Tensor] = []
 
     # 1. Instantiate Network Entry Ports
@@ -329,7 +337,7 @@ def convert_and_inject_complex_dag(
         sim: nengo.Simulator,
         network: nengo.Network,
         start_nodes: Union[nengo.Node, List[nengo.Node]],
-        output_nodes: Union[nengo.Node, nengo.Ensemble, List[Union[nengo.Node, nengo.Ensemble]]],
+        output_nodes: Union[NengoGraphObject, List[NengoGraphObject]],
         target_namespace: str,
         placeholder_op: str = "Sin",
         custom_op_name: str = "LIFSpikeLayer",
