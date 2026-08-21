@@ -55,7 +55,7 @@ W_dec, B_dec = conn_weights
 print(f"decoder Dense kernel W shape: {W_dec.shape}  (expected (pre.size_out={neurons.size_out}, post.size_in={out.size_in}))")
 print(f"decoder Dense bias shape:     {B_dec.shape}  (expected (post.size_in={out.size_in},))")
 
-os.makedirs("dest_2d", exist_ok=True)
+os.makedirs("dest", exist_ok=True)
 convert_and_inject_complex_dag(
     sim=sim,
     network=model,
@@ -64,5 +64,5 @@ convert_and_inject_complex_dag(
     target_namespace="lif_spike",
     placeholder_op="Sin",
     custom_op_name="LIFSpikeLayer",
-    tflite_path="dest_2d/two_neurons_2d.tflite"
+    tflite_path="dest/two_neurons_2d.tflite"
 )
