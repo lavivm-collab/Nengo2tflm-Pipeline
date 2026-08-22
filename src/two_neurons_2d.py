@@ -44,14 +44,14 @@ print(f"Decoded output shape sim.data[filtered]: {sim.data[filtered].shape}")
 print(f"Spike data shape sim.data[spikes]:       {sim.data[spikes].shape}")
 
 print("\n--- HardwareLIFEnsemble.to_keras(sim) ---")
-ens_layers, ens_weights = neurons.to_keras(sim)
-W_enc, biases = ens_weights
+ens_layers = neurons.to_keras(sim)
+W_enc, biases = ens_layers[0].get_weights()
 print(f"encoder Dense kernel W shape: {W_enc.shape}  (expected (dimensions={neurons.dimensions}, n_neurons={neurons.n_neurons}))")
 print(f"encoder Dense bias shape:     {biases.shape}  (expected (n_neurons={neurons.n_neurons},))")
 
 print("\n--- HardwareConnection.to_keras(sim) ---")
-conn_layers, conn_weights = out_conn.to_keras(sim)
-W_dec, B_dec = conn_weights
+conn_layers = out_conn.to_keras(sim)
+W_dec, B_dec = conn_layers[0].get_weights()
 print(f"decoder Dense kernel W shape: {W_dec.shape}  (expected (pre.size_out={neurons.size_out}, post.size_in={out.size_in}))")
 print(f"decoder Dense bias shape:     {B_dec.shape}  (expected (post.size_in={out.size_in},))")
 

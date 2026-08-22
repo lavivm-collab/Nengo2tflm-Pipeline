@@ -35,10 +35,17 @@ class HardwareLIFEnsemble(nengo.Ensemble):
 
         # Make the layer names distinct using the unique ensemble labels
         encoder_dense = tf.keras.layers.Dense(self.n_neurons, name=f'{clean_label}_Encoders')
+        # Build with the known input shape and inject the solved weights immediately, rather
+        # than leaving the layer unbuilt (random weights) for the caller to fix up after the
+        # fact - a forgotten set_weights() call would otherwise silently ship a model with
+        # meaningless random encoders instead of the solved NEF values, with no error at all.
+        encoder_dense.build((None, self.dimensions))
+        encoder_dense.set_weights([W, biases])
+
         hardware_lif = LIFSpikeLayer(
             tau_rc=tau_rc,
             tau_ref=tau_ref,
             v_threshold=v_threshold,
             name=f'{clean_label}_lif_spike_hardware_node'
         )
-        return [encoder_dense, hardware_lif], [W, biases]
+        return [encoder_dense, hardware_lif]

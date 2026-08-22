@@ -153,13 +153,12 @@ def build_keras_model_from_nengo(
             if src_tensor is None:
                 continue
 
-            # If the connection defines custom hardware compilation hooks, apply them
+            # If the connection defines custom hardware compilation hooks, apply them.
+            # to_keras() returns layers that are already built and weighted.
             if hasattr(conn, 'to_keras'):
-                layers, weights = conn.to_keras(sim)
                 x = src_tensor
-                for layer in layers:
+                for layer in conn.to_keras(sim):
                     x = layer(x)
-                layers[0].set_weights(weights)
                 branch_outputs.append(x)
             else:
                 branch_outputs.append(src_tensor)
@@ -173,13 +172,12 @@ def build_keras_model_from_nengo(
         else:
             total_input = branch_outputs[0]
 
-        # Execute structural translation logic on destination objects
+        # Execute structural translation logic on destination objects.
+        # to_keras() returns layers that are already built and weighted.
         if hasattr(obj, 'to_keras'):
-            layers, weights = obj.to_keras(sim)
             x = total_input
-            for layer in layers:
+            for layer in obj.to_keras(sim):
                 x = layer(x)
-            layers[0].set_weights(weights)
             tensor_map[obj] = x
         else:
             tensor_map[obj] = total_input

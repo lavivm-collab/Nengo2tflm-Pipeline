@@ -46,6 +46,16 @@ class HardwareConnection(nengo.Connection):
             self.post.size_in,
             name=f'Decoders_{pre_label}_to_{post_label}'
         )
+        # Build with the known input shape and inject the solved decoder weights immediately,
+        # rather than leaving the layer unbuilt (random weights) for the caller to fix up after
+        # the fact - a forgotten set_weights() call would otherwise silently ship a model with
+        # meaningless random decoders instead of the solved NEF values, with no error at all.
+        # When pre is an ensemble, the tensor this layer actually receives is the neuron
+        # activation output (width n_neurons), not the ensemble's decoded dimensionality -
+        # decoding happens here, in the connection, not inside the ensemble's own to_keras().
+        pre_width = self.pre.n_neurons if hasattr(self.pre, 'n_neurons') else self.pre.size_out
+        decoder_dense.build((None, pre_width))
+        decoder_dense.set_weights([W, B])
 
         # Start our layers array with just the dense layer
         layers = [decoder_dense]
@@ -61,5 +71,5 @@ class HardwareConnection(nengo.Connection):
             )
             layers.append(hardware_synapse)
 
-        # Return the dynamically built layers list along with the weights
-        return layers, [W, B]
+        # Return the dynamically built layers - already fully weighted, no separate injection step
+        return layers
