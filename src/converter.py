@@ -2,7 +2,7 @@ import os
 import tempfile
 import shutil
 from collections import deque
-from typing import List, Union, Dict, Any, Deque
+from typing import List, Union, Dict, Any, Deque, TypeVar
 import nengo
 import tensorflow as tf
 from tensorflow.core.protobuf import saved_model_pb2
@@ -111,6 +111,18 @@ def collect_synapse_params(network: nengo.Network) -> List[Dict[str, Any]]:
 # STAGE 2: Keras Structural Model Builder
 # =====================================================================
 
+_T = TypeVar("_T")
+
+
+def _single_or_list(items: List[_T]) -> Union[_T, List[_T]]:
+    """
+    Keras's Model(inputs=..., outputs=...) treats a length-1 list differently from a
+    bare tensor, so both call sites need to unwrap down to the single item when there's
+    only one - this names that check once instead of repeating it per call site.
+    """
+    return items[0] if len(items) == 1 else items
+
+
 def build_keras_model_from_nengo(
         sim: nengo.Simulator,
         network: nengo.Network,
@@ -192,8 +204,8 @@ def build_keras_model_from_nengo(
             final_outputs.append(renamed_terminal)
 
     return tf.keras.Model(
-        inputs=input_tensors if len(input_tensors) > 1 else input_tensors[0],
-        outputs=final_outputs if len(final_outputs) > 1 else final_outputs[0]
+        inputs=_single_or_list(input_tensors),
+        outputs=_single_or_list(final_outputs)
     )
 
 
