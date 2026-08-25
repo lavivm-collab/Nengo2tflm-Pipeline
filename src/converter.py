@@ -71,7 +71,13 @@ def collect_ensemble_params(sorted_nodes: List[NengoGraphObject]) -> List[Dict[s
     """
     ensembles_found = []
     for obj in sorted_nodes:
-        if obj.__class__.__name__ == "HardwareLIFEnsemble" or hasattr(obj, 'neuron_type'):
+        # hasattr(obj, 'to_keras') is what actually means "hardware-mapped" here, matching
+        # the same duck-typed check used everywhere else in this file - hasattr(obj,
+        # 'neuron_type') alone would also match plain, non-hardware nengo.Ensemble instances
+        # (every Ensemble has one), which would both collect useless entries and widen the
+        # collision surface for the label-matching in patch_saved_model_protobuf. Requiring
+        # both keeps this specifically "hardware-mapped and ensemble-shaped".
+        if hasattr(obj, 'to_keras') and hasattr(obj, 'neuron_type'):
             tau_rc = getattr(obj.neuron_type, 'tau_rc', 0.02)
             tau_ref = getattr(obj.neuron_type, 'tau_ref', 0.002)
             v_threshold = 1.0
@@ -163,7 +169,16 @@ def build_keras_model_from_nengo(
         for conn in incoming_conns:
             src_tensor = tensor_map.get(conn.pre)
             if src_tensor is None:
-                continue
+                # Should be unreachable given a valid topological order - every predecessor
+                # is visited before its successors, so it should already be in tensor_map.
+                # Failing loudly here beats silently dropping this branch (and potentially
+                # cascading into dropping obj's own successors too) if that guarantee is
+                # ever violated by a bug elsewhere.
+                raise RuntimeError(
+                    f"Internal error: no tensor found for '{str(conn.pre.label)}', "
+                    f"predecessor of '{str(obj.label)}', despite processing in "
+                    f"topological order. This indicates a bug in the graph walk."
+                )
 
             # If the connection defines custom hardware compilation hooks, apply them.
             # to_keras() returns layers that are already built and weighted.
@@ -174,9 +189,6 @@ def build_keras_model_from_nengo(
                 branch_outputs.append(x)
             else:
                 branch_outputs.append(src_tensor)
-
-        if not branch_outputs:
-            continue
 
         # Manage structural path convergence (ResNet-style parallel tracking sum)
         if len(branch_outputs) > 1:
@@ -216,7 +228,9 @@ def build_keras_model_from_nengo(
 def register_custom_hardware_op(custom_op_name: str) -> None:
     """
     Registers custom hardware execution primitives into the active TensorFlow process
-    environment context to defend against graph loading parsing crashes.
+    environment context. This is a required step, not a defensive one - the model will
+    still build without it, but the resulting flatbuffer's custom ops will silently be
+    missing their configuration.
 
     Declaring the neuron/synapse constants as real `attr` fields (not just setting them on
     the NodeDef later) is what makes them survive into the TFLite flatbuffer's
@@ -242,12 +256,14 @@ def register_custom_hardware_op(custom_op_name: str) -> None:
         f"attr: {{ name: 'dt' type: 'float' default_value: {{ f: 0.001 }} }}"
     )
 
-    try:
-        from tensorflow.lite.python.convert import register_custom_opdefs
-        register_custom_opdefs([synapse_opdef, lif_opdef])
-        print(f"[Registry] Registered custom signatures for 'HardwareSynapseLayer' and '{custom_op_name}'")
-    except Exception as e:
-        print(f"[Registry] Non-critical warning during custom OpDef allocation step: {e}")
+    # Deliberately not caught: if this fails, the declared attrs never make it into the
+    # OpDef, which means tau_rc/tau_ref/v_threshold/tau/dt get silently dropped from
+    # custom_options later with no error of any kind (verified empirically this session).
+    # A model that "succeeds" without this step is a plausible-looking but functionally
+    # broken one - better to fail loudly here than produce that silently.
+    from tensorflow.lite.python.convert import register_custom_opdefs
+    register_custom_opdefs([synapse_opdef, lif_opdef])
+    print(f"[Registry] Registered custom signatures for 'HardwareSynapseLayer' and '{custom_op_name}'")
 
 
 def patch_saved_model_protobuf(
@@ -286,10 +302,13 @@ def patch_saved_model_protobuf(
             # Swap Sine operations matching our target namespace with custom LIF layer ops
             if target_namespace.lower() in name_lower and node.op == placeholder_op:
                 node.op = custom_op_name
-                # Identify which specific ensemble this node belongs to by label match,
-                # so a multi-ensemble network doesn't get one ensemble's tau on every node.
+                # Identify which specific ensemble this node belongs to by matching the
+                # full name HardwareLIFEnsemble.to_keras() actually generates, not just the
+                # bare label - two ensembles labeled e.g. "A" and "AB" would otherwise let
+                # "a" match nodes belonging to "AB" too, misattributing tau_rc/tau_ref.
                 for ensemble in ensembles:
-                    if ensemble["label"].lower() in name_lower:
+                    ensemble_node_name = f"{ensemble['label']}_lif_spike_hardware_node".lower()
+                    if ensemble_node_name in name_lower:
                         set_float_attr(node, "tau_rc", ensemble["tau_rc"])
                         set_float_attr(node, "tau_ref", ensemble["tau_ref"])
                         set_float_attr(node, "v_threshold", ensemble["v_threshold"])
@@ -335,6 +354,7 @@ def compile_saved_model_to_tflite(saved_model_dir: str, tflite_path: str) -> Non
 
     tflite_model = converter.convert()
 
+    os.makedirs(os.path.dirname(tflite_path) or ".", exist_ok=True)
     with open(tflite_path, "wb") as f:
         f.write(tflite_model)
 
