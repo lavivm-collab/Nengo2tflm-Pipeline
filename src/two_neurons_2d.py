@@ -61,8 +61,5 @@ convert_and_inject_complex_dag(
     network=model,
     start_nodes=sin,
     output_nodes=out,
-    target_namespace="lif_spike",
-    placeholder_op="Sin",
-    custom_op_name="LIFSpikeLayer",
     tflite_path="dest/two_neurons_2d.tflite"
 )

@@ -2,11 +2,9 @@ import os
 import tempfile
 import shutil
 from collections import deque
-from typing import List, Union, Dict, Any, Deque, TypeVar
+from typing import List, Union, Dict, Deque, TypeVar
 import nengo
 import tensorflow as tf
-from tensorflow.core.protobuf import saved_model_pb2
-from tensorflow.core.framework import attr_value_pb2
 
 # A component of the Nengo DAG we compile: either a population of neurons or an
 # input/output port. Used throughout instead of repeating the Union inline, which had
@@ -58,59 +56,6 @@ def topological_sort_and_detect_loops(network: nengo.Network) -> List[NengoGraph
         )
 
     return execution_order
-
-
-# =====================================================================
-# STAGE 1b: SHARED HARDWARE PARAMETER EXTRACTION
-# =====================================================================
-
-def collect_ensemble_params(sorted_nodes: List[NengoGraphObject]) -> List[Dict[str, Any]]:
-    """
-    Extracts per-ensemble neuron-model constants (tau_rc, tau_ref, v_threshold), used by the
-    protobuf attribute patcher (Stage 3) to stamp each op with its own solved values.
-    """
-    ensembles_found = []
-    for obj in sorted_nodes:
-        # hasattr(obj, 'to_keras') is what actually means "hardware-mapped" here, matching
-        # the same duck-typed check used everywhere else in this file - hasattr(obj,
-        # 'neuron_type') alone would also match plain, non-hardware nengo.Ensemble instances
-        # (every Ensemble has one), which would both collect useless entries and widen the
-        # collision surface for the label-matching in patch_saved_model_protobuf. Requiring
-        # both keeps this specifically "hardware-mapped and ensemble-shaped".
-        if hasattr(obj, 'to_keras') and hasattr(obj, 'neuron_type'):
-            tau_rc = getattr(obj.neuron_type, 'tau_rc', 0.02)
-            tau_ref = getattr(obj.neuron_type, 'tau_ref', 0.002)
-            v_threshold = 1.0
-
-            ensembles_found.append({
-                "label": (obj.label or f"ensemble_{id(obj)}").replace(" ", "_"),
-                "neurons": obj.n_neurons,
-                "dimensions": obj.dimensions,
-                "tau_rc": float(tau_rc),
-                "tau_ref": float(tau_ref),
-                "v_threshold": float(v_threshold)
-            })
-    return ensembles_found
-
-
-def collect_synapse_params(network: nengo.Network) -> List[Dict[str, Any]]:
-    """
-    Extracts per-connection synaptic filter constants (tau), used by the protobuf
-    attribute patcher (Stage 3) to stamp each op with its own solved values.
-    """
-    synapses_found = []
-    for conn in network.all_connections:
-        if hasattr(conn, 'synapse') and hasattr(conn.synapse, 'tau'):
-            pre_label = (conn.pre.label or f"node_{id(conn.pre)}").replace(" ", "_")
-            post_label = (conn.post.label or f"node_{id(conn.post)}").replace(" ", "_")
-            tau = float(conn.synapse.tau)
-
-            synapses_found.append({
-                "pre_label": pre_label,
-                "post_label": post_label,
-                "tau": tau
-            })
-    return synapses_found
 
 
 # =====================================================================
@@ -222,131 +167,14 @@ def build_keras_model_from_nengo(
 
 
 # =====================================================================
-# STAGE 3: PROTOBUF OPERATION MANIPULATION ENGINE
+# STAGE 3: TFLITE COMPILATION
 # =====================================================================
-
-def register_custom_hardware_op(custom_op_name: str) -> None:
-    """
-    Registers custom hardware execution primitives into the active TensorFlow process
-    environment context. This is a required step, not a defensive one - the model will
-    still build without it, but the resulting flatbuffer's custom ops will silently be
-    missing their configuration.
-
-    Declaring the neuron/synapse constants as real `attr` fields (not just setting them on
-    the NodeDef later) is what makes them survive into the TFLite flatbuffer's
-    custom_options: an unregistered NodeDef attr gets silently dropped during conversion
-    ("Unknown attributes will be ignored"), but a declared one gets packed into a real
-    FlexBuffer that a TFLM kernel can read at Init() time.
-    """
-    synapse_opdef = (
-        "name: 'HardwareSynapseLayer'\n"
-        "input_arg: { name: 'x' type: DT_FLOAT }\n"
-        "output_arg: { name: 'y' type: DT_FLOAT }\n"
-        "attr: { name: 'tau' type: 'float' default_value: { f: 0.01 } }\n"
-        "attr: { name: 'dt' type: 'float' default_value: { f: 0.001 } }"
-    )
-
-    lif_opdef = (
-        f"name: '{custom_op_name}'\n"
-        f"input_arg: {{ name: 'x' type: DT_FLOAT }}\n"
-        f"output_arg: {{ name: 'y' type: DT_FLOAT }}\n"
-        f"attr: {{ name: 'tau_rc' type: 'float' default_value: {{ f: 0.02 }} }}\n"
-        f"attr: {{ name: 'tau_ref' type: 'float' default_value: {{ f: 0.002 }} }}\n"
-        f"attr: {{ name: 'v_threshold' type: 'float' default_value: {{ f: 1.0 }} }}\n"
-        f"attr: {{ name: 'dt' type: 'float' default_value: {{ f: 0.001 }} }}"
-    )
-
-    # Deliberately not caught: if this fails, the declared attrs never make it into the
-    # OpDef, which means tau_rc/tau_ref/v_threshold/tau/dt get silently dropped from
-    # custom_options later with no error of any kind (verified empirically this session).
-    # A model that "succeeds" without this step is a plausible-looking but functionally
-    # broken one - better to fail loudly here than produce that silently.
-    from tensorflow.lite.python.convert import register_custom_opdefs
-    register_custom_opdefs([synapse_opdef, lif_opdef])
-    print(f"[Registry] Registered custom signatures for 'HardwareSynapseLayer' and '{custom_op_name}'")
-
-
-def patch_saved_model_protobuf(
-        saved_model_dir: str,
-        target_namespace: str,
-        placeholder_op: str,
-        custom_op_name: str,
-        ensembles: List[Dict[str, Any]],
-        synapses: List[Dict[str, Any]],
-        dt: float
-) -> int:
-    """
-    Surgically audits SavedModel serialized binary charts, swapping baseline mathematical
-    placeholders (Sin/Cos) with target downstream hardware microkernel assignments, and
-    stamps each patched node with its solved neuron/synapse constants (plus the global
-    simulation timestep) as real op attrs, so a TFLM kernel can read its own configuration
-    directly from custom_options instead of needing a separately-matched header entry.
-    """
-    saved_model_path = os.path.join(saved_model_dir, "saved_model.pb")
-    sm = saved_model_pb2.SavedModel()
-
-    with tf.io.gfile.GFile(saved_model_path, "rb") as f:
-        sm.ParseFromString(f.read())
-
-    patch_count = 0
-
-    def set_float_attr(node, attr_name: str, value: float) -> None:
-        node.attr[attr_name].CopyFrom(attr_value_pb2.AttrValue(f=float(value)))
-
-    # Unified internal worker function to update computational nodes
-    def patch_node_list(nodes):
-        nonlocal patch_count
-        for node in nodes:
-            name_lower = node.name.lower()
-
-            # Swap Sine operations matching our target namespace with custom LIF layer ops
-            if target_namespace.lower() in name_lower and node.op == placeholder_op:
-                node.op = custom_op_name
-                # Identify which specific ensemble this node belongs to by matching the
-                # full name HardwareLIFEnsemble.to_keras() actually generates, not just the
-                # bare label - two ensembles labeled e.g. "A" and "AB" would otherwise let
-                # "a" match nodes belonging to "AB" too, misattributing tau_rc/tau_ref.
-                for ensemble in ensembles:
-                    ensemble_node_name = f"{ensemble['label']}_lif_spike_hardware_node".lower()
-                    if ensemble_node_name in name_lower:
-                        set_float_attr(node, "tau_rc", ensemble["tau_rc"])
-                        set_float_attr(node, "tau_ref", ensemble["tau_ref"])
-                        set_float_attr(node, "v_threshold", ensemble["v_threshold"])
-                        break
-                set_float_attr(node, "dt", dt)
-                patch_count += 1
-
-            # Swap Cosine operations within synapse containers with custom Synapse layer ops
-            elif "hardware_synapse" in name_lower and node.op == "Cos":
-                node.op = "HardwareSynapseLayer"
-                for synapse in synapses:
-                    synapse_name = f"hardware_synapse_{synapse['pre_label']}_to_{synapse['post_label']}".lower()
-                    if synapse_name in name_lower:
-                        set_float_attr(node, "tau", synapse["tau"])
-                        break
-                set_float_attr(node, "dt", dt)
-                patch_count += 1
-
-    for meta_graph in sm.meta_graphs:
-        # Route processing through Main Blueprint Nodes
-        patch_node_list(meta_graph.graph_def.node)
-
-        # Route processing through Sub-compiled Function Def Library Blocks
-        for func in meta_graph.graph_def.library.function:
-            patch_node_list(func.node_def)
-
-    # Save modified structural records back out to disk
-    with tf.io.gfile.GFile(saved_model_path, "wb") as f:
-        f.write(sm.SerializeToString())
-
-    return patch_count
-
 
 def compile_saved_model_to_tflite(saved_model_dir: str, tflite_path: str) -> None:
     """
     Invokes the production TFLite compilation subsystem to write out your finalized flatbuffer model binary.
     """
-    print("[TFLite Compiler] Compiling patched blueprint to flatbuffer...")
+    print("[TFLite Compiler] Compiling saved model to flatbuffer...")
     converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
 
     converter.allow_custom_ops = True
@@ -360,7 +188,7 @@ def compile_saved_model_to_tflite(saved_model_dir: str, tflite_path: str) -> Non
 
 
 # =====================================================================
-# STAGE 4: INTEGRATED PIPELINE ORCHESTRATOR
+# PIPELINE ORCHESTRATOR
 # =====================================================================
 
 def convert_and_inject_complex_dag(
@@ -368,45 +196,29 @@ def convert_and_inject_complex_dag(
         network: nengo.Network,
         start_nodes: Union[nengo.Node, List[nengo.Node]],
         output_nodes: Union[NengoGraphObject, List[NengoGraphObject]],
-        target_namespace: str,
-        placeholder_op: str = "Sin",
-        custom_op_name: str = "LIFSpikeLayer",
         tflite_path: str = "snn.tflite"
 ) -> None:
     """
     Executes the comprehensive pipeline to transform your architectural Nengo model
-    into a custom hardware-accelerated TFLite deployment bundle.
+    into a custom-op TFLite deployment bundle. The custom hardware ops (and the solved
+    constants they carry) are emitted directly by the Keras layers themselves - see
+    layers/custom_ops.py - so there is no post-save patching step.
     """
     # Step 1: Model conversion
     sorted_nodes = topological_sort_and_detect_loops(network)
     keras_model = build_keras_model_from_nengo(sim, network, start_nodes, output_nodes, sorted_nodes)
     print("[Pipeline] Keras structural translation complete.")
 
-    # Step 2: Custom Op Environment Signatures Registration
-    register_custom_hardware_op(custom_op_name)
-
-    # Collect the solved neuron/synapse constants once, stamped onto their ops in Step 4
-    ensembles = collect_ensemble_params(sorted_nodes)
-    synapses = collect_synapse_params(network)
-
     # Use secure sandbox memory allocation context for disk-based transformation steps
     temp_dir = tempfile.mkdtemp()
     try:
-        # Step 3: Serialize unpatched model configuration structures to storage disk
+        # Step 2: Serialize the model to storage disk
         keras_model.save(temp_dir)
 
-        # Step 4: Run Protobuf Deep-Patcher tool to map hardware execution ops and stamp
-        # each patched op with its solved neuron/synapse constants as real op attrs
-        patches = patch_saved_model_protobuf(
-            temp_dir, target_namespace, placeholder_op, custom_op_name,
-            ensembles, synapses, sim.dt
-        )
-        print(f"[Pipeline] Deep patch complete. Mutated {patches} nodes to hardware operations.")
-
-        # Step 5: Final flatbuffer generation
+        # Step 3: Final flatbuffer generation
         compile_saved_model_to_tflite(temp_dir, tflite_path)
         print(f"[Pipeline] Success! Final compiled binary delivered to -> {tflite_path}")
 
     finally:
-        # Step 6: Clear out temporary scratchpad workspace assets from filesystem
+        # Step 4: Clear out temporary scratchpad workspace assets from filesystem
         shutil.rmtree(temp_dir)

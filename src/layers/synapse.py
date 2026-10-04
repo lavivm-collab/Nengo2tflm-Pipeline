@@ -2,6 +2,8 @@ import nengo
 import numpy as np
 import tensorflow as tf
 
+from .custom_ops import hardware_synapse_op
+
 
 @tf.keras.utils.register_keras_serializable()
 class SynapseFilterLayer(tf.keras.layers.Layer):
@@ -12,9 +14,7 @@ class SynapseFilterLayer(tf.keras.layers.Layer):
         self.size_in = int(size_in)
 
     def call(self, inputs):
-        # Use Cosine as a 1-to-1 placeholder!
-        # TFLite won't optimize it away, and it maps perfectly to our 1-input custom op.
-        return tf.math.cos(inputs)
+        return hardware_synapse_op(inputs, self.tau, self.dt)
 
     def get_config(self):
         config = super().get_config()
@@ -65,7 +65,7 @@ class HardwareConnection(nengo.Connection):
             tau = float(self.synapse.tau)
             hardware_synapse = SynapseFilterLayer(
                 tau=tau,
-                dt=0.001,
+                dt=sim.dt,
                 size_in=self.pre.size_out,
                 name=f'Hardware_Synapse_{pre_label}_to_{post_label}'
             )

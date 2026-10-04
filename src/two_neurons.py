@@ -67,8 +67,5 @@ convert_and_inject_complex_dag(
         network=model,
         start_nodes=sin,                # The entry node
         output_nodes=out,          # The final component to track
-        target_namespace="lif_spike",   # The substring our injector hunts for
-        placeholder_op="Sin",           # The dummy math used in Python
-        custom_op_name="LIFSpikeLayer", # The final token for the C++ microcontroller
         tflite_path="dest/two_neurons.tflite"
     )

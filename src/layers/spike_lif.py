@@ -2,23 +2,27 @@ import nengo
 import numpy as np
 import tensorflow as tf
 
+from .custom_ops import lif_spike_op
+
 @tf.keras.utils.register_keras_serializable()
 class LIFSpikeLayer(tf.keras.layers.Layer):
-    def __init__(self, tau_rc=0.02, tau_ref=0.002, v_threshold=1.0, **kwargs):
+    def __init__(self, tau_rc=0.02, tau_ref=0.002, v_threshold=1.0, dt=0.001, **kwargs):
         super().__init__(**kwargs)
         self.tau_rc = float(tau_rc)
         self.tau_ref = float(tau_ref)
         self.v_threshold = float(v_threshold)
+        self.dt = float(dt)
 
     def call(self, inputs):
-        return tf.math.sin(inputs)
+        return lif_spike_op(inputs, self.tau_rc, self.tau_ref, self.v_threshold, self.dt)
 
     def get_config(self):
         config = super().get_config()
         config.update({
             "tau_rc": self.tau_rc,
             "tau_ref": self.tau_ref,
-            "v_threshold": self.v_threshold
+            "v_threshold": self.v_threshold,
+            "dt": self.dt
         })
         return config
 
@@ -46,6 +50,7 @@ class HardwareLIFEnsemble(nengo.Ensemble):
             tau_rc=tau_rc,
             tau_ref=tau_ref,
             v_threshold=v_threshold,
+            dt=sim.dt,
             name=f'{clean_label}_lif_spike_hardware_node'
         )
         return [encoder_dense, hardware_lif]
